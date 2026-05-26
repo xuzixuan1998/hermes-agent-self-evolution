@@ -24,3 +24,6 @@ snapshots/
 .vscode/
 *.swp
 *.swo
+output/
+datasets/
+.venv/

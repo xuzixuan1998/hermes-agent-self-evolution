@@ -104,36 +104,63 @@ class LLMJudge:
         )
 
 
+def _keyword_overlap(output: str, expected: str) -> float:
+    """Fast keyword-overlap heuristic score (0.0-1.0)."""
+    if not output.strip():
+        return 0.0
+
+    expected_lower = expected.lower()
+    output_lower = output.lower()
+
+    expected_words = set(expected_lower.split())
+    output_words = set(output_lower.split())
+    if not expected_words:
+        return 0.5
+
+    overlap = len(expected_words & output_words) / len(expected_words)
+    return min(1.0, max(0.0, 0.3 + 0.7 * overlap))
+
+
+def _summarize_trajectory(messages: list[dict], max_messages: int = 20) -> dict:
+    """Summarize an agent execution trajectory for side_info.
+
+    Extracts tool call names, message count, and a truncated summary.
+    """
+    total = len(messages)
+    truncated = messages[:max_messages]
+    remaining = total - max_messages
+
+    tool_calls_used = []
+    for msg in truncated:
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls", []) or []:
+                name = tc.get("function", {}).get("name", "")
+                if name and name not in tool_calls_used:
+                    tool_calls_used.append(name)
+
+    summary = f"{total} messages, {len(tool_calls_used)} unique tools"
+    if tool_calls_used:
+        summary += f": {', '.join(tool_calls_used)}"
+    if remaining > 0:
+        summary += f" ... ({remaining} more messages)"
+
+    return {
+        "total_messages": total,
+        "tool_calls_used": tool_calls_used,
+        "summary": summary,
+    }
+
+
 def skill_fitness_metric(example: dspy.Example, prediction: dspy.Prediction, trace=None) -> float:
     """DSPy-compatible metric function for skill optimization.
 
     This is what gets passed to dspy.GEPA(metric=...).
     Returns a float 0-1 score.
     """
-    # The prediction should have an 'output' field with the agent's response
     agent_output = getattr(prediction, "output", "") or ""
     expected = getattr(example, "expected_behavior", "") or ""
-    task = getattr(example, "task_input", "") or ""
 
-    if not agent_output.strip():
-        return 0.0
-
-    # Quick heuristic scoring (for speed during optimization)
-    # Full LLM-as-judge scoring is expensive — use it selectively
-    score = 0.5  # Base score for non-empty output
-
-    # Check if key phrases from expected behavior appear
-    expected_lower = expected.lower()
-    output_lower = agent_output.lower()
-
-    # Simple keyword overlap as a fast proxy
-    expected_words = set(expected_lower.split())
-    output_words = set(output_lower.split())
-    if expected_words:
-        overlap = len(expected_words & output_words) / len(expected_words)
-        score = 0.3 + (0.7 * overlap)
-
-    return min(1.0, max(0.0, score))
+    return _keyword_overlap(agent_output, expected)
 
 
 def _parse_score(value) -> float:
@@ -144,3 +171,135 @@ def _parse_score(value) -> float:
         return min(1.0, max(0.0, float(str(value).strip())))
     except (ValueError, TypeError):
         return 0.5  # Default to neutral on parse failure
+
+
+def make_gepa_evaluator(config: "EvolutionConfig"):
+    """Create a per-example evaluator compatible with SkillEvolutionAdapter.
+
+    Returns a function (data, response) -> EvaluationResult.
+    data is a gepa DefaultDataInst dict with 'input', 'answer' keys.
+    """
+    evaluator = config.evaluator
+    judge = LLMJudge(config) if evaluator == "llm-judge" else None
+
+    def evaluator_fn(data, response: str):
+        task_input = ""
+        expected = ""
+        if isinstance(data, dict):
+            task_input = data.get("input", "") or ""
+            expected = data.get("answer", "") or ""
+
+        feedback = ""
+        if evaluator == "llm-judge" and judge:
+            fitness = judge.score(
+                task_input=task_input,
+                expected_behavior=expected,
+                agent_output=response,
+                skill_text="",
+            )
+            score = fitness.composite
+            feedback = fitness.feedback
+        else:
+            score = _keyword_overlap(response, expected)
+
+        from gepa.adapters.default_adapter.default_adapter import EvaluationResult
+        return EvaluationResult(score=score, feedback=feedback)
+
+    return evaluator_fn
+
+
+class SkillEvolutionAdapter:
+    """Custom GEPAAdapter that runs skill evaluation via Hermes agent or single-turn LLM.
+
+    Implements gepa's GEPAAdapter protocol so the full agent execution (tool calls,
+    multi-turn reasoning) is part of the evaluation, not just a single LLM completion.
+    """
+
+    def __init__(self, config: "EvolutionConfig"):
+        from evolution.skills.skill_module import run_single_turn, run_hermes_agent
+
+        self.config = config
+        self.inference = config.inference_mode
+        self.evaluator = config.evaluator
+        self.run_fn = run_hermes_agent if self.inference == "hermes-agent" else run_single_turn
+        self.judge = LLMJudge(config) if self.evaluator == "llm-judge" else None
+        self._trajectories: list[dict] = []
+
+    @property
+    def trajectories(self) -> list[dict]:
+        return self._trajectories
+
+    def evaluate(self, batch, candidate, capture_traces=False):
+        """Run candidate on each DataInst and return EvaluationBatch."""
+        from gepa.core.adapter import EvaluationBatch
+
+        skill_text = ""
+        if isinstance(candidate, dict):
+            skill_text = candidate.get("skill_body", "") or ""
+
+        outputs = []
+        scores = []
+        trajectories = []
+
+        for data in batch:
+            task_input = ""
+            expected = ""
+            if isinstance(data, dict):
+                task_input = data.get("input", "") or ""
+                expected = data.get("answer", "") or ""
+
+            result = self.run_fn(skill_text, task_input, self.config)
+            output = result["output"]
+            messages = result["messages"]
+
+            if self.evaluator == "llm-judge" and self.judge:
+                fitness = self.judge.score(
+                    task_input=task_input,
+                    expected_behavior=expected,
+                    agent_output=output,
+                    skill_text=skill_text,
+                )
+                score = fitness.composite
+                feedback = fitness.feedback
+            else:
+                score = _keyword_overlap(output, expected)
+                feedback = ""
+
+            outputs.append(output)
+            scores.append(score)
+
+            # Always record trajectory for analysis
+            traj = {
+                "task_input": task_input,
+                "expected": expected,
+                "output": output[:500] if output else "",
+                "score": score,
+                "feedback": feedback,
+                "trajectory": _summarize_trajectory(messages) if self.inference == "hermes-agent" else {},
+                "messages": messages[:10] if messages else [],
+            }
+            trajectories.append(traj)
+            self._trajectories.append(traj)
+
+        return EvaluationBatch(
+            outputs=outputs,
+            scores=scores,
+            trajectories=trajectories if capture_traces else None,
+        )
+
+    def make_reflective_dataset(self, candidate, eval_batch, components_to_update):
+        """Build a reflective dataset from evaluation trajectories."""
+        dataset = {}
+        for comp in components_to_update:
+            records = []
+            if eval_batch.trajectories:
+                for traj in eval_batch.trajectories:
+                    records.append({
+                        "Inputs": {"task": traj.get("task_input", "")},
+                        "Generated Outputs": {"output": traj.get("output", "")},
+                        "Feedback": traj.get("feedback", ""),
+                        "Expected": traj.get("expected", ""),
+                        "Score": traj.get("score", 0.0),
+                    })
+            dataset[comp] = records
+        return dataset

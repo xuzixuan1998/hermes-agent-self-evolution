@@ -85,6 +85,25 @@ class EvalDataset:
             for ex in data
         ]
 
+    def to_gepa_datainst(self, split: str = "train") -> list[dict]:
+        """Convert a split to gepa DataInst dicts.
+
+        Returns list of dicts with 'input', 'answer', 'additional_context' keys
+        compatible with gepa.optimize_anything.
+        """
+        data = getattr(self, split)
+        return [
+            {
+                "input": ex.task_input,
+                "answer": ex.expected_behavior,
+                "additional_context": {
+                    "difficulty": ex.difficulty,
+                    "category": ex.category,
+                },
+            }
+            for ex in data
+        ]
+
 
 class SyntheticDatasetBuilder:
     """Generate evaluation datasets using a strong LLM.

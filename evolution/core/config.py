@@ -39,6 +39,15 @@ class EvolutionConfig:
     run_tblite: bool = False  # Expensive — opt-in
     tblite_regression_threshold: float = 0.02  # Max 2% regression allowed
 
+    # Inference mode: "single-turn" (dspy.ChainOfThought) or "hermes-agent" (AIAgent.run_conversation)
+    inference_mode: str = "single-turn"
+    # Evaluator: "fast" (keyword overlap) or "llm-judge" (LLMJudge 3D scoring)
+    evaluator: str = "fast"
+    # Model for Hermes agent inference (None = fall back to optimizer_model at wiring level)
+    agent_model: Optional[str] = None
+    # Max tool-calling iterations per agent invocation
+    agent_max_iterations: int = 10
+
     # Output
     output_dir: Path = field(default_factory=lambda: Path("./output"))
     create_pr: bool = True

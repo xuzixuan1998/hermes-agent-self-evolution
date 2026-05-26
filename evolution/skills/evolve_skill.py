@@ -21,7 +21,7 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, get_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
+from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore, make_gepa_evaluator, SkillEvolutionAdapter
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
     SkillModule,
@@ -31,6 +31,52 @@ from evolution.skills.skill_module import (
 )
 
 console = Console()
+
+
+def _save_output_artifacts(output_dir, skill_name, timestamp, iterations,
+                           inference_mode, evaluator, agent_model, optimizer_model,
+                           eval_model, dataset, skill, evolved_body, elapsed,
+                           all_pass, avg_baseline, avg_evolved, improvement,
+                           eval_source, agent_max_iterations, trajectory_records,
+                           console):
+    """Save all output artifacts: skill files, metrics, config, trajectories."""
+    evolved_full = reassemble_skill(skill["frontmatter"], evolved_body)
+
+    (output_dir / "evolved_skill.md").write_text(evolved_full)
+    (output_dir / "baseline_skill.md").write_text(skill["raw"])
+
+    metrics = {
+        "skill_name": skill_name, "timestamp": timestamp, "iterations": iterations,
+        "inference_mode": inference_mode, "evaluator": evaluator,
+        "agent_model": agent_model or optimizer_model,
+        "agent_max_iterations": agent_max_iterations,
+        "optimizer_model": optimizer_model, "eval_model": eval_model,
+        "baseline_score": avg_baseline, "evolved_score": avg_evolved,
+        "improvement": improvement,
+        "baseline_size": len(skill["body"]), "evolved_size": len(evolved_body),
+        "train_examples": len(dataset.train), "val_examples": len(dataset.val),
+        "holdout_examples": len(dataset.holdout),
+        "elapsed_seconds": elapsed, "constraints_passed": all_pass,
+    }
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    config_snapshot = {
+        "inference_mode": inference_mode, "evaluator": evaluator,
+        "agent_model": agent_model or optimizer_model,
+        "agent_max_iterations": agent_max_iterations,
+        "optimizer_model": optimizer_model, "eval_model": eval_model,
+        "iterations": iterations, "eval_source": eval_source,
+        "timestamp": timestamp, "skill_name": skill_name,
+    }
+    (output_dir / "config.json").write_text(json.dumps(config_snapshot, indent=2))
+
+    if trajectory_records:
+        with open(output_dir / "trajectories.jsonl", "w") as f:
+            for rec in trajectory_records:
+                f.write(json.dumps(rec, default=str) + "\n")
+        console.print(f"  Trajectories saved: {len(trajectory_records)} records")
+
+    console.print(f"\n  Output saved to {output_dir}/")
 
 
 def evolve(
@@ -43,6 +89,10 @@ def evolve(
     hermes_repo: Optional[str] = None,
     run_tests: bool = False,
     dry_run: bool = False,
+    inference_mode: str = "single-turn",
+    evaluator: str = "fast",
+    agent_model: Optional[str] = None,
+    agent_max_iterations: int = 10,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -52,6 +102,10 @@ def evolve(
         eval_model=eval_model,
         judge_model=eval_model,  # Use same model for dataset generation
         run_pytest=run_tests,
+        inference_mode=inference_mode,
+        evaluator=evaluator,
+        agent_model=agent_model,
+        agent_max_iterations=agent_max_iterations,
     )
     if hermes_repo:
         config.hermes_agent_path = Path(hermes_repo)
@@ -72,6 +126,10 @@ def evolve(
 
     if dry_run:
         console.print(f"\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
+        console.print(f"  Inference: {inference_mode}, Evaluator: {evaluator}")
+        if inference_mode == "hermes-agent":
+            agent_fallback = agent_model or optimizer_model
+            console.print(f"  Agent model: {agent_fallback} (max {agent_max_iterations} iterations)")
         console.print(f"  Would generate eval dataset (source: {eval_source})")
         console.print(f"  Would run GEPA optimization ({iterations} iterations)")
         console.print(f"  Would validate constraints and create PR")
@@ -119,7 +177,7 @@ def evolve(
     # ── 3. Validate constraints on baseline ─────────────────────────────
     console.print(f"\n[bold]Validating baseline constraints[/bold]")
     validator = ConstraintValidator(config)
-    baseline_constraints = validator.validate_all(skill["body"], "skill")
+    baseline_constraints = validator.validate_all(skill["raw"], "skill")
     all_pass = True
     for c in baseline_constraints:
         icon = "✓" if c.passed else "✗"
@@ -131,62 +189,104 @@ def evolve(
     if not all_pass:
         console.print("[yellow]⚠ Baseline skill has constraint violations — proceeding anyway[/yellow]")
 
-    # ── 4. Set up DSPy + GEPA optimizer ─────────────────────────────────
+    # ── 4. Set up optimizer ────────────────────────────────────────────
+    use_legacy_dspy = (inference_mode == "single-turn" and evaluator == "fast")
+
     console.print(f"\n[bold]Configuring optimizer[/bold]")
-    console.print(f"  Optimizer: GEPA ({iterations} iterations)")
+    console.print(f"  Inference: {inference_mode}, Evaluator: {evaluator}")
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
+    if not use_legacy_dspy:
+        console.print(f"  Engine: gepa.optimize")
+        console.print(f"  Agent model: {agent_model or optimizer_model}")
+        console.print(f"  Agent max iterations: {agent_max_iterations}")
+    else:
+        console.print(f"  Engine: dspy.GEPA (legacy)")
 
     # Configure DSPy
     lm = dspy.LM(eval_model)
     dspy.configure(lm=lm)
 
-    # Create the baseline skill module
-    baseline_module = SkillModule(skill["body"])
+    # Store trajectories for output (gepa path only)
+    trajectory_records: list[dict] = []
 
-    # Prepare DSPy examples
-    trainset = dataset.to_dspy_examples("train")
-    valset = dataset.to_dspy_examples("val")
-
-    # ── 5. Run GEPA optimization ────────────────────────────────────────
+    # ── 5. Run optimization ──────────────────────────────────────────
     console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
 
     start_time = time.time()
 
-    try:
-        optimizer = dspy.GEPA(
-            metric=skill_fitness_metric,
-            max_steps=iterations,
+    if use_legacy_dspy:
+        # ── Legacy path: dspy.GEPA (single-turn + fast) ─────────────
+        baseline_module = SkillModule(skill["body"])
+        trainset = dataset.to_dspy_examples("train")
+        valset = dataset.to_dspy_examples("val")
+
+        try:
+            optimizer = dspy.GEPA(
+                metric=skill_fitness_metric,
+                max_steps=iterations,
+            )
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+                valset=valset,
+            )
+        except Exception as e:
+            console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
+            optimizer = dspy.MIPROv2(
+                metric=skill_fitness_metric,
+                auto="light",
+            )
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+            )
+
+        evolved_body = optimized_module.skill_text
+
+    else:
+        # ── New path: gepa.optimize() with custom adapter ─────────
+        from gepa import optimize
+
+        adapter = SkillEvolutionAdapter(config)
+
+        gepa_trainset = dataset.to_gepa_datainst("train")
+        gepa_valset = dataset.to_gepa_datainst("val")
+
+        seed_candidate = {"skill_body": skill["body"]}
+
+        result = optimize(
+            seed_candidate=seed_candidate,
+            trainset=gepa_trainset,
+            valset=gepa_valset,
+            adapter=adapter,
+            reflection_lm=optimizer_model,
+            max_metric_calls=iterations,
+            display_progress_bar=True,
         )
 
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-            valset=valset,
-        )
-    except Exception as e:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
-        console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
-        optimizer = dspy.MIPROv2(
-            metric=skill_fitness_metric,
-            auto="light",
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-        )
+        # Extract best candidate from tracked candidates
+        if result.candidates:
+            best_candidate = result.candidates[-1]  # Last accepted candidate
+            if isinstance(best_candidate, dict):
+                evolved_body = best_candidate.get("skill_body", "") or skill["body"]
+            else:
+                evolved_body = skill["body"]
+        else:
+            evolved_body = skill["body"]
+
+        # Collect trajectories from the adapter
+        trajectory_records = adapter.trajectories
 
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
 
     # ── 6. Extract evolved skill text ───────────────────────────────────
-    # The optimized module's instructions contain the evolved skill text
-    evolved_body = optimized_module.skill_text
     evolved_full = reassemble_skill(skill["frontmatter"], evolved_body)
 
     # ── 7. Validate evolved skill ───────────────────────────────────────
     console.print(f"\n[bold]Validating evolved skill[/bold]")
-    evolved_constraints = validator.validate_all(evolved_body, "skill", baseline_text=skill["body"])
+    evolved_constraints = validator.validate_all(evolved_full, "skill", baseline_text=skill["raw"])
     all_pass = True
     for c in evolved_constraints:
         icon = "✓" if c.passed else "✗"
@@ -198,10 +298,16 @@ def evolve(
     if not all_pass:
         console.print("[red]✗ Evolved skill FAILED constraints — not deploying[/red]")
         # Still save for inspection
-        output_path = Path("output") / skill_name / "evolved_FAILED.md"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(evolved_full)
-        console.print(f"  Saved failed variant to {output_path}")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path("output") / skill_name / timestamp
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "evolved_FAILED.md").write_text(evolved_full)
+        _save_output_artifacts(output_dir, skill_name, timestamp, iterations,
+                               inference_mode, evaluator, agent_model, optimizer_model,
+                               eval_model, dataset, skill, evolved_body, elapsed,
+                               all_pass, 0.0, 0.0, 0.0,
+                               eval_source, agent_max_iterations, trajectory_records,
+                               console)
         return
 
     # ── 8. Evaluate on holdout set ──────────────────────────────────────
@@ -211,6 +317,8 @@ def evolve(
 
     baseline_scores = []
     evolved_scores = []
+    baseline_module = SkillModule(skill["body"])
+    evolved_module = SkillModule(evolved_body)
     for ex in holdout_examples:
         # Score baseline
         with dspy.context(lm=lm):
@@ -218,7 +326,7 @@ def evolve(
             baseline_score = skill_fitness_metric(ex, baseline_pred)
             baseline_scores.append(baseline_score)
 
-            evolved_pred = optimized_module(task_input=ex.task_input)
+            evolved_pred = evolved_module(task_input=ex.task_input)
             evolved_score = skill_fitness_metric(ex, evolved_pred)
             evolved_scores.append(evolved_score)
 
@@ -257,33 +365,12 @@ def evolve(
     output_dir = Path("output") / skill_name / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save evolved skill
-    (output_dir / "evolved_skill.md").write_text(evolved_full)
-
-    # Save baseline for comparison
-    (output_dir / "baseline_skill.md").write_text(skill["raw"])
-
-    # Save metrics
-    metrics = {
-        "skill_name": skill_name,
-        "timestamp": timestamp,
-        "iterations": iterations,
-        "optimizer_model": optimizer_model,
-        "eval_model": eval_model,
-        "baseline_score": avg_baseline,
-        "evolved_score": avg_evolved,
-        "improvement": improvement,
-        "baseline_size": len(skill["body"]),
-        "evolved_size": len(evolved_body),
-        "train_examples": len(dataset.train),
-        "val_examples": len(dataset.val),
-        "holdout_examples": len(dataset.holdout),
-        "elapsed_seconds": elapsed,
-        "constraints_passed": all_pass,
-    }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-
-    console.print(f"\n  Output saved to {output_dir}/")
+    _save_output_artifacts(output_dir, skill_name, timestamp, iterations,
+                           inference_mode, evaluator, agent_model, optimizer_model,
+                           eval_model, dataset, skill, evolved_body, elapsed,
+                           all_pass, avg_baseline, avg_evolved, improvement,
+                           eval_source, agent_max_iterations, trajectory_records,
+                           console)
 
     if improvement > 0:
         console.print(f"\n[bold green]✓ Evolution improved skill by {improvement:+.3f} ({improvement/max(0.001, avg_baseline)*100:+.1f}%)[/bold green]")
@@ -304,7 +391,16 @@ def evolve(
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run):
+@click.option("--inference", "inference_mode", default="single-turn",
+              type=click.Choice(["single-turn", "hermes-agent"]),
+              help="How to execute the skill during evaluation")
+@click.option("--evaluator", "evaluator", default="fast",
+              type=click.Choice(["fast", "llm-judge"]),
+              help="How to score agent outputs")
+@click.option("--agent-model", default=None, help="Model for Hermes agent inference (defaults to --optimizer-model)")
+@click.option("--agent-max-iterations", default=10, type=int,
+              help="Max tool-calling rounds per agent run")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, inference_mode, evaluator, agent_model, agent_max_iterations):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -316,6 +412,10 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         hermes_repo=hermes_repo,
         run_tests=run_tests,
         dry_run=dry_run,
+        inference_mode=inference_mode,
+        evaluator=evaluator,
+        agent_model=agent_model,
+        agent_max_iterations=agent_max_iterations,
     )
 
 

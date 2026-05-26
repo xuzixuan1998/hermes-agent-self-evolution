@@ -6,10 +6,65 @@ mutate the skill text and evaluate the results.
 """
 
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 
 import dspy
+
+
+def run_single_turn(skill_text: str, task_input: str, config) -> dict:
+    """Execute a skill as a single-turn LLM call using dspy.ChainOfThought.
+
+    Returns unified dict: {"output": str, "messages": list[dict], "completed": bool}
+    """
+    class _SingleTurn(dspy.Signature):
+        """Complete a task following the provided skill instructions."""
+        skill_instructions: str = dspy.InputField(desc="The skill instructions to follow")
+        task_input: str = dspy.InputField(desc="The task to complete")
+        output: str = dspy.OutputField(desc="Your response following the skill instructions")
+
+    predictor = dspy.ChainOfThought(_SingleTurn)
+    result = predictor(skill_instructions=skill_text, task_input=task_input)
+
+    messages = [
+        {"role": "user", "content": task_input},
+        {"role": "assistant", "content": getattr(result, "output", "") or ""},
+    ]
+    return {"output": getattr(result, "output", "") or "", "messages": messages, "completed": True}
+
+
+def run_hermes_agent(skill_text: str, task_input: str, config) -> dict:
+    """Execute a skill via real Hermes agent (AIAgent.run_conversation).
+
+    Returns unified dict: {"output": str, "messages": list[dict], "completed": bool}
+    """
+    if str(config.hermes_agent_path) not in sys.path:
+        sys.path.insert(0, str(config.hermes_agent_path))
+
+    from run_agent import AIAgent
+
+    model = config.agent_model or config.optimizer_model
+
+    agent = AIAgent(
+        model=model,
+        quiet_mode=True,
+        max_iterations=config.agent_max_iterations,
+        enabled_toolsets=["terminal", "web"],
+    )
+
+    try:
+        result = agent.run_conversation(
+            user_message=task_input,
+            system_message=skill_text,
+        )
+        return {
+            "output": result.get("final_response", "") or "",
+            "messages": result.get("messages", []),
+            "completed": True,
+        }
+    except Exception:
+        return {"output": "", "messages": [], "completed": False}
 
 
 def load_skill(skill_path: Path) -> dict:

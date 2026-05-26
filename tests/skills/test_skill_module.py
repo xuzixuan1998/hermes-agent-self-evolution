@@ -2,7 +2,16 @@
 
 import pytest
 from pathlib import Path
-from evolution.skills.skill_module import load_skill, reassemble_skill
+from unittest.mock import MagicMock, patch
+
+import dspy
+
+from evolution.skills.skill_module import (
+    load_skill,
+    reassemble_skill,
+    run_hermes_agent,
+    run_single_turn,
+)
 
 
 SAMPLE_SKILL = """---
@@ -90,3 +99,81 @@ class TestReassembleSkill:
 
         assert "EVOLVED" in result
         assert "New and improved" in result
+
+
+class TestRunSingleTurn:
+    """Tests for run_single_turn."""
+
+    def test_run_single_turn_returns_dict(self):
+        """Mock dspy.ChainOfThought, verify returns dict with output/messages/completed."""
+        with patch.object(dspy, "ChainOfThought") as mock_cot:
+            mock_instance = MagicMock()
+            mock_instance.return_value = MagicMock(output="test response")
+            mock_cot.return_value = mock_instance
+
+            result = run_single_turn("test skill", "test input", None)
+
+            assert isinstance(result, dict)
+            assert "output" in result
+            assert "messages" in result
+            assert "completed" in result
+            assert result["completed"] is True
+            assert len(result["messages"]) >= 2
+            assert result["output"] == "test response"
+
+
+class TestRunHermesAgent:
+    """Tests for run_hermes_agent."""
+
+    def _make_mock_config(self):
+        config = MagicMock()
+        config.agent_model = "gpt-4"
+        config.agent_max_iterations = 10
+        return config
+
+    def test_run_hermes_agent_returns_dict(self):
+        """Mock AIAgent, verify returns dict with output/messages/completed."""
+        mock_run_agent = MagicMock()
+        mock_agent_class = MagicMock()
+        mock_instance = MagicMock()
+        mock_instance.run_conversation.return_value = {
+            "final_response": "mock response",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+        }
+        mock_agent_class.return_value = mock_instance
+        mock_run_agent.AIAgent = mock_agent_class
+
+        with patch.dict("sys.modules", {"run_agent": mock_run_agent}):
+            result = run_hermes_agent(
+                "test skill", "test input", self._make_mock_config()
+            )
+
+        assert isinstance(result, dict)
+        assert "output" in result
+        assert "messages" in result
+        assert "completed" in result
+        assert result["completed"] is True
+        assert result["output"] == "mock response"
+        assert len(result["messages"]) == 2
+
+    def test_run_hermes_agent_handles_exception(self):
+        """Mock AIAgent.run_conversation to raise, verify returns completed=False."""
+        mock_run_agent = MagicMock()
+        mock_agent_class = MagicMock()
+        mock_instance = MagicMock()
+        mock_instance.run_conversation.side_effect = RuntimeError("Agent failure")
+        mock_agent_class.return_value = mock_instance
+        mock_run_agent.AIAgent = mock_agent_class
+
+        with patch.dict("sys.modules", {"run_agent": mock_run_agent}):
+            result = run_hermes_agent(
+                "test skill", "test input", self._make_mock_config()
+            )
+
+        assert isinstance(result, dict)
+        assert result["completed"] is False
+        assert result["output"] == ""
+        assert result["messages"] == []
