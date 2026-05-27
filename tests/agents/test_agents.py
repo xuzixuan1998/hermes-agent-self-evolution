@@ -1,14 +1,15 @@
 """Tests for pluggable agent inference backends."""
 
-import asyncio
+import os
 from unittest.mock import MagicMock, patch
 
 import dspy
+import httpx
 
 from evolution.agents.base import BaseAgent
 from evolution.agents.single_turn import SingleTurnAgent
 from evolution.agents.hermes_agent import HermesAgent
-from evolution.agents.edp_agent import EDPAgent, _collect_stream, _edp_initialized
+from evolution.agents.edp_agent import EDPAgent
 
 
 class TestBaseAgent:
@@ -104,183 +105,60 @@ class TestHermesAgent:
 
 
 class TestEDPAgent:
+    _env = {
+        "EDP_INFER_URL": "http://localhost/infer",
+        "EDP_AGENTRULE_UPDATE_URL": "http://localhost/agentrule",
+        "EDP_SKILL_UPDATE_URL": "http://localhost/skill",
+    }
+
     def _make_mock_config(self):
         config = MagicMock()
-        config.agent_framework_path = None
         config.agent_model = "gpt-4"
         config.agent_max_iterations = 10
         return config
 
-    def test_run_returns_dict(self):
-        """EDPAgent.run returns unified dict format."""
-        import sys
-        from evolution.agents import edp_agent
-
-        edp_agent._edp_initialized = True
-
-        fake_edp_agent = MagicMock()
-        with patch.dict(sys.modules, {"edp_agent": fake_edp_agent, "edp_agent.agent": fake_edp_agent.agent}), \
-             patch.object(edp_agent, "asyncio") as mock_asyncio:
-            mock_asyncio.run.return_value = {
-                "output": "test output",
-                "messages": [{"role": "think", "content": "thinking"}],
-                "completed": True,
+    def test_run_returns_trajectory(self):
+        with patch.dict(os.environ, self._env), patch("httpx.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "output": "hello", "messages": [], "completed": True,
             }
+            mock_post.return_value.raise_for_status = MagicMock()
 
             agent = EDPAgent()
-            result = agent.run("prompt text", "task input", self._make_mock_config())
+            result = agent.run("system_prompt", "task_input", self._make_mock_config())
 
-        assert isinstance(result, dict)
-        assert "output" in result
-        assert "messages" in result
-        assert "completed" in result
-        assert result["output"] == "test output"
-        assert result["completed"] is True
-        fake_edp_agent.agent.reload_agent_rule.assert_called_once_with("prompt text")
+            assert result["completed"] is True
+            assert result["output"] == "hello"
 
-    def test_run_lazy_init(self):
-        """First call triggers _ensure_initialized; second call skips it."""
-        import sys
-        from evolution.agents import edp_agent
-
-        edp_agent._edp_initialized = False
-
-        fake_edp_agent = MagicMock()
-        # Make asyncio.run actually execute _ensure_initialized to set the flag
-        _real_run = edp_agent.asyncio.run
-        def _side_effect(coro):
-            if getattr(coro, '__name__', '') == '_ensure_initialized':
-                # Don't actually run (needs real edp_agent), just simulate
-                pass
-        mock_asyncio = MagicMock()
-        mock_asyncio.run.side_effect = _side_effect
-        mock_asyncio.run.return_value = {
-            "output": "ok", "messages": [], "completed": True,
-        }
-
-        with patch.dict(sys.modules, {"edp_agent": fake_edp_agent, "edp_agent.agent": fake_edp_agent.agent}), \
-             patch.object(edp_agent, "asyncio", mock_asyncio):
+    def test_update_agentrule_posts_body(self):
+        with patch.dict(os.environ, self._env), patch("httpx.post") as mock_post:
+            mock_post.return_value.raise_for_status = MagicMock()
 
             agent = EDPAgent()
-            agent.run("prompt", "input", self._make_mock_config())
+            agent.update_agentrule("new body")
 
-        # _ensure_initialized would have set the flag if asyncio.run executed it.
-        # Since asyncio is mocked, manually set the flag to simulate init completion.
-        edp_agent._edp_initialized = True
+            mock_post.assert_called_once_with(
+                agent._agentrule_update_url,
+                json={"body": "new body"},
+            )
 
-        # Second call — should skip init since _edp_initialized is now True
-        with patch.dict(sys.modules, {"edp_agent": fake_edp_agent, "edp_agent.agent": fake_edp_agent.agent}), \
-             patch.object(edp_agent, "asyncio") as mock_asyncio2:
-            mock_asyncio2.run.return_value = {
-                "output": "ok2", "messages": [], "completed": True,
-            }
-            agent = EDPAgent()
-            result = agent.run("prompt", "input", self._make_mock_config())
-            assert result["output"] == "ok2"
-
-    def test_collect_stream_builds_messages(self):
-        """_collect_stream maps ThinkChunk/ToolStart/ToolEnd/FinalAnswerChunk correctly."""
-        import sys
-        events = []
-
-        think = MagicMock()
-        think.type = "think_chunk"
-        think.content = "Let me think..."
-        events.append(think)
-
-        tool_start = MagicMock()
-        tool_start.type = "tool_start"
-        tool_start.plugin = "search"
-        events.append(tool_start)
-
-        tool_end = MagicMock()
-        tool_end.type = "tool_end"
-        tool_end.plugin = "search"
-        events.append(tool_end)
-
-        answer = MagicMock()
-        answer.type = "final_answer_chunk"
-        answer.content = "The answer is 42"
-        events.append(answer)
-
-        conv_end = MagicMock()
-        conv_end.type = "conversation_end"
-        events.append(conv_end)
-
-        async def mock_stream(**kwargs):
-            for e in events:
-                yield e
-
-        fake_edp_agent = MagicMock()
-        fake_edp_agent.agent.agent_stream = mock_stream
-        with patch.dict(sys.modules, {"edp_agent": fake_edp_agent, "edp_agent.agent": fake_edp_agent.agent}):
-            result = asyncio.run(_collect_stream("conv-id", "query"))
-
-        assert result["completed"] is True
-        assert "The answer is 42" in result["output"]
-        assert len(result["messages"]) == 3  # think + tool_start + tool_end
-        assert result["messages"][0] == {"role": "think", "content": "Let me think..."}
-        assert result["messages"][1] == {"role": "tool", "name": "search", "content": "start"}
-        assert result["messages"][2] == {"role": "tool", "name": "search", "content": "end"}
-
-    def test_collect_stream_empty(self):
-        """Empty event stream returns completed=False."""
-        import sys
-
-        async def mock_stream(**kwargs):
-            if False:
-                yield
-
-        fake_edp_agent = MagicMock()
-        fake_edp_agent.agent.agent_stream = mock_stream
-        with patch.dict(sys.modules, {"edp_agent": fake_edp_agent, "edp_agent.agent": fake_edp_agent.agent}):
-            result = asyncio.run(_collect_stream("conv-id", "query"))
-
-        assert result["completed"] is False
-        assert result["output"] == ""
-        assert result["messages"] == []
-
-    def test_run_exception_handling(self):
-        """Exception in EDPAgent.run returns completed=False, no raise."""
-        from evolution.agents import edp_agent
-
-        edp_agent._edp_initialized = True
-
-        with patch.object(edp_agent, "asyncio") as mock_asyncio:
-            mock_asyncio.run.side_effect = RuntimeError("agent stream failed")
+    def test_update_skill_posts_name_and_body(self):
+        with patch.dict(os.environ, self._env), patch("httpx.post") as mock_post:
+            mock_post.return_value.raise_for_status = MagicMock()
 
             agent = EDPAgent()
-            result = agent.run("prompt", "input", self._make_mock_config())
+            agent.update_skill("my_skill", "skill body")
 
-        assert isinstance(result, dict)
-        assert result["completed"] is False
-        assert result["output"] == ""
-        assert result["messages"] == []
+            mock_post.assert_called_once_with(
+                agent._skill_update_url,
+                json={"name": "my_skill", "body": "skill body"},
+            )
 
-    def test_run_releases_session_on_error(self):
-        """Release is called even when _collect_stream raises."""
-        import sys
-        from evolution.agents import edp_agent
-
-        edp_agent._edp_initialized = True
-
-        call_order = []
-
-        def mock_asyncio_run(coro):
-            name = getattr(coro, "__name__", "")
-            call_order.append(name)
-            if "_collect_stream" in name:
-                raise RuntimeError("stream failure")
-            return None
-
-        fake_edp_agent = MagicMock()
-        with patch.dict(sys.modules, {"edp_agent": fake_edp_agent, "edp_agent.agent": fake_edp_agent.agent}), \
-             patch.object(edp_agent, "asyncio") as mock_asyncio:
-            mock_asyncio.run.side_effect = mock_asyncio_run
-
+    def test_run_handles_http_error_gracefully(self):
+        with patch.dict(os.environ, self._env), patch("httpx.post", side_effect=httpx.HTTPError("down")):
             agent = EDPAgent()
-            result = agent.run("prompt", "input", self._make_mock_config())
+            result = agent.run("sp", "task", self._make_mock_config())
 
-        assert result["completed"] is False
-        release_calls = [c for c in call_order if "_release_session" in c]
-        assert len(release_calls) == 1
+            assert result["completed"] is False
+            assert result["output"] == ""
+            assert result["messages"] == []

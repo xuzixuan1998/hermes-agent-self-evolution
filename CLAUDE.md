@@ -10,6 +10,11 @@ The project is currently in Phase 1 (skill evolution), with Phases 2-5 (tools, p
 
 ## Commands
 
+**Note:** This environment requires proxy to be disabled for `uv` and `pip` commands:
+```bash
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+```
+
 ```bash
 # Install (uv manages venv + dependencies)
 uv sync

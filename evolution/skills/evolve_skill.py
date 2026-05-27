@@ -421,3 +421,4 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
 
 if __name__ == "__main__":
     main()
+    main()

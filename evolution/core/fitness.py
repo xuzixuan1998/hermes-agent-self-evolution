@@ -284,7 +284,9 @@ class EvolutionAdapter:
                 "output": output[:500] if output else "",
                 "score": score,
                 "feedback": feedback,
-                "trajectory": _summarize_trajectory(messages) if self.inference == "hermes-agent" else {},
+                "trajectory": _summarize_trajectory(messages)
+            if self.inference in ("hermes-agent", "edp-agent")
+            else {},
                 "messages": messages[:10] if messages else [],
             }
             trajectories.append(traj)

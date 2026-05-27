@@ -21,7 +21,7 @@ from evolution.core.artifact import load_artifact, reassemble_artifact
 from evolution.core.config import EvolutionConfig
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore, make_gepa_evaluator, EvolutionAdapter
+from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore, make_gepa_evaluator, EvolutionAdapter, _keyword_overlap
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import SkillModule
 
@@ -305,21 +305,20 @@ def evolve(
     # ── 8. Evaluate on holdout set ──────────────────────────────────────
     console.print(f"\n[bold]Evaluating on holdout set ({len(dataset.holdout)} examples)[/bold]")
 
-    holdout_examples = dataset.to_dspy_examples("holdout")
+    holdout_insts = dataset.to_gepa_datainst("holdout")
 
     baseline_scores = []
     evolved_scores = []
-    baseline_module = SkillModule(artifact["body"])
-    evolved_module = SkillModule(evolved_body)
-    for ex in holdout_examples:
-        with dspy.context(lm=lm):
-            baseline_pred = baseline_module(task_input=ex.task_input)
-            baseline_score = skill_fitness_metric(ex, baseline_pred)
-            baseline_scores.append(baseline_score)
+    for data in holdout_insts:
+        task_input = data["input"]
 
-            evolved_pred = evolved_module(task_input=ex.task_input)
-            evolved_score = skill_fitness_metric(ex, evolved_pred)
-            evolved_scores.append(evolved_score)
+        baseline_result = adapter.agent.run(artifact["body"], task_input, config)
+        baseline_score = _keyword_overlap(baseline_result["output"], data["answer"])
+        baseline_scores.append(baseline_score)
+
+        evolved_result = adapter.agent.run(evolved_body, task_input, config)
+        evolved_score = _keyword_overlap(evolved_result["output"], data["answer"])
+        evolved_scores.append(evolved_score)
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
