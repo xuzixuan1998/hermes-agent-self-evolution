@@ -13,18 +13,15 @@ from datetime import datetime
 from typing import Optional
 
 import click
-import dspy
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 
-from evolution.core.config import EvolutionConfig, get_hermes_agent_path
+from evolution.core.config import EvolutionConfig
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore, make_gepa_evaluator, EvolutionAdapter
+from evolution.core.fitness import EvolutionAdapter, _keyword_overlap
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
-    SkillModule,
     load_skill,
     find_skill,
     reassemble_skill,
@@ -106,6 +103,7 @@ def evolve(
         evaluator=evaluator,
         agent_model=agent_model,
         agent_max_iterations=agent_max_iterations,
+        skill_name=skill_name,
     )
     if hermes_repo:
         config.hermes_agent_path = Path(hermes_repo)
@@ -190,93 +188,49 @@ def evolve(
         console.print("[yellow]⚠ Baseline skill has constraint violations — proceeding anyway[/yellow]")
 
     # ── 4. Set up optimizer ────────────────────────────────────────────
-    use_legacy_dspy = (inference_mode == "single-turn" and evaluator == "fast")
 
     console.print(f"\n[bold]Configuring optimizer[/bold]")
     console.print(f"  Inference: {inference_mode}, Evaluator: {evaluator}")
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
-    if not use_legacy_dspy:
-        console.print(f"  Engine: gepa.optimize")
-        console.print(f"  Agent model: {agent_model or optimizer_model}")
-        console.print(f"  Agent max iterations: {agent_max_iterations}")
-    else:
-        console.print(f"  Engine: dspy.GEPA (legacy)")
-
-    # Configure DSPy
-    lm = dspy.LM(eval_model)
-    dspy.configure(lm=lm)
-
-    # Store trajectories for output (gepa path only)
-    trajectory_records: list[dict] = []
+    console.print(f"  Engine: gepa.optimize")
+    console.print(f"  Agent model: {agent_model or optimizer_model}")
+    console.print(f"  Agent max iterations: {agent_max_iterations}")
 
     # ── 5. Run optimization ──────────────────────────────────────────
     console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
 
+    from gepa import optimize
+
+    adapter = EvolutionAdapter(config)
+
+    gepa_trainset = dataset.to_gepa_datainst("train")
+    gepa_valset = dataset.to_gepa_datainst("val")
+
+    seed_candidate = {"artifact_body": skill["body"]}
+
     start_time = time.time()
 
-    if use_legacy_dspy:
-        # ── Legacy path: dspy.GEPA (single-turn + fast) ─────────────
-        baseline_module = SkillModule(skill["body"])
-        trainset = dataset.to_dspy_examples("train")
-        valset = dataset.to_dspy_examples("val")
+    result = optimize(
+        seed_candidate=seed_candidate,
+        trainset=gepa_trainset,
+        valset=gepa_valset,
+        adapter=adapter,
+        reflection_lm=optimizer_model,
+        max_metric_calls=iterations,
+        display_progress_bar=True,
+    )
 
-        try:
-            optimizer = dspy.GEPA(
-                metric=skill_fitness_metric,
-                max_steps=iterations,
-            )
-            optimized_module = optimizer.compile(
-                baseline_module,
-                trainset=trainset,
-                valset=valset,
-            )
-        except Exception as e:
-            console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
-            optimizer = dspy.MIPROv2(
-                metric=skill_fitness_metric,
-                auto="light",
-            )
-            optimized_module = optimizer.compile(
-                baseline_module,
-                trainset=trainset,
-            )
-
-        evolved_body = optimized_module.skill_text
-
-    else:
-        # ── New path: gepa.optimize() with custom adapter ─────────
-        from gepa import optimize
-
-        adapter = EvolutionAdapter(config)
-
-        gepa_trainset = dataset.to_gepa_datainst("train")
-        gepa_valset = dataset.to_gepa_datainst("val")
-
-        seed_candidate = {"artifact_body": skill["body"]}
-
-        result = optimize(
-            seed_candidate=seed_candidate,
-            trainset=gepa_trainset,
-            valset=gepa_valset,
-            adapter=adapter,
-            reflection_lm=optimizer_model,
-            max_metric_calls=iterations,
-            display_progress_bar=True,
-        )
-
-        # Extract best candidate from tracked candidates
-        if result.candidates:
-            best_candidate = result.candidates[-1]  # Last accepted candidate
-            if isinstance(best_candidate, dict):
-                evolved_body = best_candidate.get("artifact_body", "") or skill["body"]
-            else:
-                evolved_body = skill["body"]
+    if result.candidates:
+        best_candidate = result.candidates[-1]
+        if isinstance(best_candidate, dict):
+            evolved_body = best_candidate.get("artifact_body", "") or skill["body"]
         else:
             evolved_body = skill["body"]
+    else:
+        evolved_body = skill["body"]
 
-        # Collect trajectories from the adapter
-        trajectory_records = adapter.trajectories
+    trajectory_records = adapter.trajectories
 
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
@@ -313,22 +267,36 @@ def evolve(
     # ── 8. Evaluate on holdout set ──────────────────────────────────────
     console.print(f"\n[bold]Evaluating on holdout set ({len(dataset.holdout)} examples)[/bold]")
 
-    holdout_examples = dataset.to_dspy_examples("holdout")
+    holdout_insts = dataset.to_gepa_datainst("holdout")
 
     baseline_scores = []
     evolved_scores = []
-    baseline_module = SkillModule(skill["body"])
-    evolved_module = SkillModule(evolved_body)
-    for ex in holdout_examples:
-        # Score baseline
-        with dspy.context(lm=lm):
-            baseline_pred = baseline_module(task_input=ex.task_input)
-            baseline_score = skill_fitness_metric(ex, baseline_pred)
-            baseline_scores.append(baseline_score)
+    for data in holdout_insts:
+        task_input = data["input"]
 
-            evolved_pred = evolved_module(task_input=ex.task_input)
-            evolved_score = skill_fitness_metric(ex, evolved_pred)
-            evolved_scores.append(evolved_score)
+        baseline_result = adapter.agent.run(skill["body"], task_input, config)
+        evolved_result = adapter.agent.run(evolved_body, task_input, config)
+
+        if evaluator == "llm-judge" and adapter.judge:
+            baseline_fitness = adapter.judge.score(
+                task_input=task_input,
+                expected_behavior=data["answer"],
+                agent_output=baseline_result["output"],
+                skill_text=skill["body"],
+            )
+            baseline_scores.append(baseline_fitness.composite)
+            evolved_fitness = adapter.judge.score(
+                task_input=task_input,
+                expected_behavior=data["answer"],
+                agent_output=evolved_result["output"],
+                skill_text=evolved_body,
+            )
+            evolved_scores.append(evolved_fitness.composite)
+        else:
+            baseline_scores.append(
+                _keyword_overlap(baseline_result["output"], data["answer"]))
+            evolved_scores.append(
+                _keyword_overlap(evolved_result["output"], data["answer"]))
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))

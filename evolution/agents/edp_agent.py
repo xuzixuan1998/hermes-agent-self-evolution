@@ -33,7 +33,10 @@ class EDPAgent(BaseAgent):
 
     def run(self, system_prompt: str, task_input: str, config) -> dict:
         try:
-            self.update_agentrule(system_prompt)
+            if config is not None and getattr(config, "skill_name", None):
+                self.update_skill(config.skill_name, system_prompt)
+            else:
+                self.update_agentrule(system_prompt)
             return self.infer(task_input)
         except Exception:
             logger.exception("EDPAgent.run failed")

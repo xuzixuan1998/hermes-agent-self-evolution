@@ -111,10 +111,11 @@ class TestEDPAgent:
         "EDP_SKILL_UPDATE_URL": "http://localhost/skill",
     }
 
-    def _make_mock_config(self):
+    def _make_mock_config(self, skill_name=None):
         config = MagicMock()
         config.agent_model = "gpt-4"
         config.agent_max_iterations = 10
+        config.skill_name = skill_name
         return config
 
     def test_run_returns_trajectory(self):
@@ -153,6 +154,29 @@ class TestEDPAgent:
                 agent._skill_update_url,
                 json={"name": "my_skill", "body": "skill body"},
             )
+
+    def test_run_calls_update_skill_when_skill_name_set(self):
+        with patch.dict(os.environ, self._env), patch("httpx.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "output": "ok", "messages": [], "completed": True,
+            }
+            mock_post.return_value.raise_for_status = MagicMock()
+
+            agent = EDPAgent()
+            config = self._make_mock_config(skill_name="my_skill")
+            agent.run("skill body text", "task", config)
+
+            # Skill evolution: should call update_skill, not update_agentrule
+            skill_calls = [
+                c for c in mock_post.call_args_list
+                if c.kwargs.get("json", {}).get("name") == "my_skill"
+            ]
+            agentrule_calls = [
+                c for c in mock_post.call_args_list
+                if "body" in c.kwargs.get("json", {}) and "name" not in c.kwargs.get("json", {})
+            ]
+            assert len(skill_calls) == 1
+            assert len(agentrule_calls) == 0
 
     def test_run_handles_http_error_gracefully(self):
         with patch.dict(os.environ, self._env), patch("httpx.post", side_effect=httpx.HTTPError("down")):

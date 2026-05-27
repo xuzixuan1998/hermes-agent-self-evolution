@@ -48,6 +48,8 @@ class EvolutionConfig:
     agent_model: Optional[str] = None
     # Max tool-calling iterations per agent invocation
     agent_max_iterations: int = 10
+    # Skill name for EDPAgent skill update (None = prompt evolution, no skill update)
+    skill_name: Optional[str] = None
 
     # Output
     output_dir: Path = field(default_factory=lambda: Path("./output"))
