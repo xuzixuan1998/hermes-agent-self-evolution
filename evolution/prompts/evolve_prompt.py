@@ -1,0 +1,414 @@
+"""Evolve an agent prompt (e.g., AgentRule.md) using DSPy + GEPA.
+
+Usage:
+    python -m evolution.prompts.evolve_prompt --prompt edp_agent/AgentRule.md --inference edp-agent --iterations 10
+    python -m evolution.prompts.evolve_prompt --prompt /path/to/AgentRule.md --dry-run
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+
+import click
+import dspy
+from rich.console import Console
+from rich.table import Table
+
+from evolution.core.artifact import load_artifact, reassemble_artifact
+from evolution.core.config import EvolutionConfig
+from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
+from evolution.core.external_importers import build_dataset_from_external
+from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore, make_gepa_evaluator, EvolutionAdapter
+from evolution.core.constraints import ConstraintValidator
+from evolution.skills.skill_module import SkillModule
+
+console = Console()
+
+
+def _save_output_artifacts(output_dir, prompt_name, timestamp, iterations,
+                           inference_mode, evaluator, agent_model, optimizer_model,
+                           eval_model, dataset, artifact, evolved_body, elapsed,
+                           all_pass, avg_baseline, avg_evolved, improvement,
+                           eval_source, agent_max_iterations, trajectory_records,
+                           console):
+    """Save all output artifacts: prompt files, metrics, config, trajectories."""
+    evolved_full = reassemble_artifact(artifact["frontmatter"], evolved_body)
+
+    (output_dir / "evolved_prompt.md").write_text(evolved_full)
+    (output_dir / "baseline_prompt.md").write_text(artifact["raw"])
+
+    metrics = {
+        "prompt_name": prompt_name, "timestamp": timestamp, "iterations": iterations,
+        "inference_mode": inference_mode, "evaluator": evaluator,
+        "agent_model": agent_model or optimizer_model,
+        "agent_max_iterations": agent_max_iterations,
+        "optimizer_model": optimizer_model, "eval_model": eval_model,
+        "baseline_score": avg_baseline, "evolved_score": avg_evolved,
+        "improvement": improvement,
+        "baseline_size": len(artifact["body"]), "evolved_size": len(evolved_body),
+        "train_examples": len(dataset.train), "val_examples": len(dataset.val),
+        "holdout_examples": len(dataset.holdout),
+        "elapsed_seconds": elapsed, "constraints_passed": all_pass,
+    }
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    config_snapshot = {
+        "inference_mode": inference_mode, "evaluator": evaluator,
+        "agent_model": agent_model or optimizer_model,
+        "agent_max_iterations": agent_max_iterations,
+        "optimizer_model": optimizer_model, "eval_model": eval_model,
+        "iterations": iterations, "eval_source": eval_source,
+        "timestamp": timestamp, "prompt_name": prompt_name,
+    }
+    (output_dir / "config.json").write_text(json.dumps(config_snapshot, indent=2))
+
+    if trajectory_records:
+        with open(output_dir / "trajectories.jsonl", "w") as f:
+            for rec in trajectory_records:
+                f.write(json.dumps(rec, default=str) + "\n")
+        console.print(f"  Trajectories saved: {len(trajectory_records)} records")
+
+    console.print(f"\n  Output saved to {output_dir}/")
+
+
+def evolve(
+    prompt_path: str,
+    iterations: int = 10,
+    eval_source: str = "synthetic",
+    dataset_path: Optional[str] = None,
+    optimizer_model: str = "openai/gpt-4.1",
+    eval_model: str = "openai/gpt-4.1-mini",
+    hermes_repo: Optional[str] = None,
+    run_tests: bool = False,
+    dry_run: bool = False,
+    inference_mode: str = "single-turn",
+    evaluator: str = "fast",
+    agent_model: Optional[str] = None,
+    agent_max_iterations: int = 10,
+):
+    """Main evolution function — orchestrates prompt optimization via GEPA."""
+
+    config = EvolutionConfig(
+        iterations=iterations,
+        optimizer_model=optimizer_model,
+        eval_model=eval_model,
+        judge_model=eval_model,
+        run_pytest=run_tests,
+        inference_mode=inference_mode,
+        evaluator=evaluator,
+        agent_model=agent_model,
+        agent_max_iterations=agent_max_iterations,
+    )
+    if hermes_repo:
+        config.hermes_agent_path = Path(hermes_repo)
+
+    prompt_path = Path(prompt_path)
+    prompt_name = prompt_path.stem
+
+    # ── 1. Load the prompt file ─────────────────────────────────────────
+    console.print(f"\n[bold cyan]Hermes Agent Self-Evolution[/bold cyan] — Evolving prompt: [bold]{prompt_path}[/bold]\n")
+
+    if not prompt_path.exists():
+        console.print(f"[red]Prompt file not found: {prompt_path}[/red]")
+        sys.exit(1)
+
+    artifact = load_artifact(prompt_path)
+    console.print(f"  Loaded: {prompt_path}")
+    console.print(f"  Name: {artifact['name']}")
+    console.print(f"  Size: {len(artifact['raw']):,} chars")
+    console.print(f"  Description: {artifact['description'][:80]}...")
+
+    if dry_run:
+        console.print(f"\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
+        console.print(f"  Inference: {inference_mode}, Evaluator: {evaluator}")
+        if inference_mode == "hermes-agent":
+            agent_fallback = agent_model or optimizer_model
+            console.print(f"  Agent model: {agent_fallback} (max {agent_max_iterations} iterations)")
+        console.print(f"  Would generate eval dataset (source: {eval_source})")
+        console.print(f"  Would run GEPA optimization ({iterations} iterations)")
+        console.print(f"  Would validate constraints and create PR")
+        return
+
+    # ── 2. Build or load evaluation dataset ─────────────────────────────
+    console.print(f"\n[bold]Building evaluation dataset[/bold] (source: {eval_source})")
+
+    if eval_source == "golden" and dataset_path:
+        dataset = GoldenDatasetLoader.load(Path(dataset_path))
+        console.print(f"  Loaded golden dataset: {len(dataset.all_examples)} examples")
+    elif eval_source == "sessiondb":
+        save_path = Path(dataset_path) if dataset_path else Path("datasets") / "prompts" / prompt_name
+        dataset = build_dataset_from_external(
+            skill_name=prompt_name,
+            skill_text=artifact["raw"],
+            sources=["claude-code", "copilot", "hermes"],
+            output_path=save_path,
+            model=eval_model,
+        )
+        if not dataset.all_examples:
+            console.print("[red]No relevant examples found from session history[/red]")
+            sys.exit(1)
+        console.print(f"  Mined {len(dataset.all_examples)} examples from session history")
+    elif eval_source == "synthetic":
+        builder = SyntheticDatasetBuilder(config)
+        dataset = builder.generate(
+            artifact_text=artifact["raw"],
+            artifact_type="prompt",
+        )
+        save_path = Path("datasets") / "prompts" / prompt_name
+        dataset.save(save_path)
+        console.print(f"  Generated {len(dataset.all_examples)} synthetic examples")
+        console.print(f"  Saved to {save_path}/")
+    elif dataset_path:
+        dataset = EvalDataset.load(Path(dataset_path))
+        console.print(f"  Loaded dataset: {len(dataset.all_examples)} examples")
+    else:
+        console.print("[red]Specify --dataset-path or use --eval-source synthetic[/red]")
+        sys.exit(1)
+
+    console.print(f"  Split: {len(dataset.train)} train / {len(dataset.val)} val / {len(dataset.holdout)} holdout")
+
+    # ── 3. Validate constraints on baseline ─────────────────────────────
+    console.print(f"\n[bold]Validating baseline constraints[/bold]")
+    validator = ConstraintValidator(config)
+    baseline_constraints = validator.validate_all(artifact["raw"], "prompt")
+    all_pass = True
+    for c in baseline_constraints:
+        icon = "✓" if c.passed else "✗"
+        color = "green" if c.passed else "red"
+        console.print(f"  [{color}]{icon} {c.constraint_name}[/{color}]: {c.message}")
+        if not c.passed:
+            all_pass = False
+
+    if not all_pass:
+        console.print("[yellow]Warning: Baseline prompt has constraint violations — proceeding anyway[/yellow]")
+
+    # ── 4. Set up optimizer ────────────────────────────────────────────
+    use_legacy_dspy = (inference_mode == "single-turn" and evaluator == "fast")
+
+    console.print(f"\n[bold]Configuring optimizer[/bold]")
+    console.print(f"  Inference: {inference_mode}, Evaluator: {evaluator}")
+    console.print(f"  Optimizer model: {optimizer_model}")
+    console.print(f"  Eval model: {eval_model}")
+    if not use_legacy_dspy:
+        console.print(f"  Engine: gepa.optimize")
+        console.print(f"  Agent model: {agent_model or optimizer_model}")
+        console.print(f"  Agent max iterations: {agent_max_iterations}")
+    else:
+        console.print(f"  Engine: dspy.GEPA (legacy)")
+
+    # Configure DSPy
+    lm = dspy.LM(eval_model)
+    dspy.configure(lm=lm)
+
+    trajectory_records: list[dict] = []
+
+    # ── 5. Run optimization ──────────────────────────────────────────
+    console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
+
+    start_time = time.time()
+
+    if use_legacy_dspy:
+        # ── Legacy path: dspy.GEPA (single-turn + fast) ─────────────
+        baseline_module = SkillModule(artifact["body"])
+        trainset = dataset.to_dspy_examples("train")
+        valset = dataset.to_dspy_examples("val")
+
+        try:
+            optimizer = dspy.GEPA(
+                metric=skill_fitness_metric,
+                max_steps=iterations,
+            )
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+                valset=valset,
+            )
+        except Exception as e:
+            console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
+            optimizer = dspy.MIPROv2(
+                metric=skill_fitness_metric,
+                auto="light",
+            )
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+            )
+
+        evolved_body = optimized_module.skill_text
+
+    else:
+        # ── New path: gepa.optimize() with custom adapter ─────────
+        from gepa import optimize
+
+        adapter = EvolutionAdapter(config)
+
+        gepa_trainset = dataset.to_gepa_datainst("train")
+        gepa_valset = dataset.to_gepa_datainst("val")
+
+        seed_candidate = {"artifact_body": artifact["body"]}
+
+        result = optimize(
+            seed_candidate=seed_candidate,
+            trainset=gepa_trainset,
+            valset=gepa_valset,
+            adapter=adapter,
+            reflection_lm=optimizer_model,
+            max_metric_calls=iterations,
+            display_progress_bar=True,
+        )
+
+        if result.candidates:
+            best_candidate = result.candidates[-1]
+            if isinstance(best_candidate, dict):
+                evolved_body = best_candidate.get("artifact_body", "") or artifact["body"]
+            else:
+                evolved_body = artifact["body"]
+        else:
+            evolved_body = artifact["body"]
+
+        trajectory_records = adapter.trajectories
+
+    elapsed = time.time() - start_time
+    console.print(f"\n  Optimization completed in {elapsed:.1f}s")
+
+    # ── 6. Extract evolved prompt text ───────────────────────────────────
+    evolved_full = reassemble_artifact(artifact["frontmatter"], evolved_body)
+
+    # ── 7. Validate evolved prompt ───────────────────────────────────────
+    console.print(f"\n[bold]Validating evolved prompt[/bold]")
+    evolved_constraints = validator.validate_all(evolved_full, "prompt", baseline_text=artifact["raw"])
+    all_pass = True
+    for c in evolved_constraints:
+        icon = "✓" if c.passed else "✗"
+        color = "green" if c.passed else "red"
+        console.print(f"  [{color}]{icon} {c.constraint_name}[/{color}]: {c.message}")
+        if not c.passed:
+            all_pass = False
+
+    if not all_pass:
+        console.print("[red]Evolved prompt FAILED constraints — not deploying[/red]")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path("output") / prompt_name / timestamp
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "evolved_FAILED.md").write_text(evolved_full)
+        _save_output_artifacts(output_dir, prompt_name, timestamp, iterations,
+                               inference_mode, evaluator, agent_model, optimizer_model,
+                               eval_model, dataset, artifact, evolved_body, elapsed,
+                               all_pass, 0.0, 0.0, 0.0,
+                               eval_source, agent_max_iterations, trajectory_records,
+                               console)
+        return
+
+    # ── 8. Evaluate on holdout set ──────────────────────────────────────
+    console.print(f"\n[bold]Evaluating on holdout set ({len(dataset.holdout)} examples)[/bold]")
+
+    holdout_examples = dataset.to_dspy_examples("holdout")
+
+    baseline_scores = []
+    evolved_scores = []
+    baseline_module = SkillModule(artifact["body"])
+    evolved_module = SkillModule(evolved_body)
+    for ex in holdout_examples:
+        with dspy.context(lm=lm):
+            baseline_pred = baseline_module(task_input=ex.task_input)
+            baseline_score = skill_fitness_metric(ex, baseline_pred)
+            baseline_scores.append(baseline_score)
+
+            evolved_pred = evolved_module(task_input=ex.task_input)
+            evolved_score = skill_fitness_metric(ex, evolved_pred)
+            evolved_scores.append(evolved_score)
+
+    avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
+    avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
+    improvement = avg_evolved - avg_baseline
+
+    # ── 9. Report results ───────────────────────────────────────────────
+    table = Table(title="Evolution Results")
+    table.add_column("Metric", style="bold")
+    table.add_column("Baseline", justify="right")
+    table.add_column("Evolved", justify="right")
+    table.add_column("Change", justify="right")
+
+    change_color = "green" if improvement > 0 else "red"
+    table.add_row(
+        "Holdout Score",
+        f"{avg_baseline:.3f}",
+        f"{avg_evolved:.3f}",
+        f"[{change_color}]{improvement:+.3f}[/{change_color}]",
+    )
+    table.add_row(
+        "Prompt Size",
+        f"{len(artifact['body']):,} chars",
+        f"{len(evolved_body):,} chars",
+        f"{len(evolved_body) - len(artifact['body']):+,} chars",
+    )
+    table.add_row("Time", "", f"{elapsed:.1f}s", "")
+    table.add_row("Iterations", "", str(iterations), "")
+
+    console.print()
+    console.print(table)
+
+    # ── 10. Save output ─────────────────────────────────────────────────
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path("output") / prompt_name / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _save_output_artifacts(output_dir, prompt_name, timestamp, iterations,
+                           inference_mode, evaluator, agent_model, optimizer_model,
+                           eval_model, dataset, artifact, evolved_body, elapsed,
+                           all_pass, avg_baseline, avg_evolved, improvement,
+                           eval_source, agent_max_iterations, trajectory_records,
+                           console)
+
+    if improvement > 0:
+        console.print(f"\n[bold green]Evolution improved prompt by {improvement:+.3f} ({improvement/max(0.001, avg_baseline)*100:+.1f}%)[/bold green]")
+        console.print(f"  Review the diff: diff {output_dir}/baseline_prompt.md {output_dir}/evolved_prompt.md")
+    else:
+        console.print(f"\n[yellow]Evolution did not improve prompt (change: {improvement:+.3f})[/yellow]")
+        console.print("  Try: more iterations, better eval dataset, or different optimizer model")
+
+
+@click.command()
+@click.option("--prompt", required=True, help="Path to the prompt file to evolve (e.g., edp_agent/AgentRule.md)")
+@click.option("--iterations", default=10, help="Number of GEPA iterations")
+@click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
+              help="Source for evaluation dataset")
+@click.option("--dataset-path", default=None, help="Path to existing eval dataset (JSONL)")
+@click.option("--optimizer-model", default="openai/gpt-4.1", help="Model for GEPA reflections")
+@click.option("--eval-model", default="openai/gpt-4.1-mini", help="Model for evaluations")
+@click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
+@click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
+@click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
+@click.option("--inference", "inference_mode", default="single-turn",
+              type=click.Choice(["single-turn", "hermes-agent", "edp-agent"]),
+              help="How to execute the prompt during evaluation")
+@click.option("--evaluator", "evaluator", default="fast",
+              type=click.Choice(["fast", "llm-judge"]),
+              help="How to score agent outputs")
+@click.option("--agent-model", default=None, help="Model for agent inference (defaults to --optimizer-model)")
+@click.option("--agent-max-iterations", default=10, type=int,
+              help="Max tool-calling rounds per agent run")
+def main(prompt, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, inference_mode, evaluator, agent_model, agent_max_iterations):
+    """Evolve an agent prompt using DSPy + GEPA optimization."""
+    evolve(
+        prompt_path=prompt,
+        iterations=iterations,
+        eval_source=eval_source,
+        dataset_path=dataset_path,
+        optimizer_model=optimizer_model,
+        eval_model=eval_model,
+        hermes_repo=hermes_repo,
+        run_tests=run_tests,
+        dry_run=dry_run,
+        inference_mode=inference_mode,
+        evaluator=evaluator,
+        agent_model=agent_model,
+        agent_max_iterations=agent_max_iterations,
+    )
+
+
+if __name__ == "__main__":
+    main()
