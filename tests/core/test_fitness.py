@@ -193,3 +193,60 @@ class TestSkillFitnessMetricUnchanged:
         pred = dspy.Prediction(output="")
         score = skill_fitness_metric(ex, pred)
         assert score == 0.0
+
+
+class TestSkillEvolutionAdapterEdpAgent:
+    """Tests for SkillEvolutionAdapter wiring with edp-agent."""
+
+    def test_adapter_wires_edp_agent(self):
+        """inference_mode='edp-agent' wires run_edp_agent."""
+        config = EvolutionConfig(inference_mode="edp-agent")
+        with patch("evolution.skills.skill_module.run_edp_agent") as mock_run:
+            mock_run.return_value = {"output": "ok", "messages": [], "completed": True}
+
+            adapter = SkillEvolutionAdapter(config)
+
+            assert adapter.run_fn is mock_run
+
+    def test_adapter_run_fn_signature(self):
+        """adapter.run_fn returns dict with output/messages/completed."""
+        config = EvolutionConfig(inference_mode="edp-agent")
+        mock_run = MagicMock(return_value={
+            "output": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "completed": True,
+        })
+
+        with patch("evolution.skills.skill_module.run_edp_agent", mock_run):
+            adapter = SkillEvolutionAdapter(config)
+            result = adapter.run_fn("skill text", "task input", config)
+
+        assert isinstance(result, dict)
+        assert "output" in result
+        assert "messages" in result
+        assert "completed" in result
+        assert result["output"] == "test"
+        assert result["completed"] is True
+
+    def test_adapter_evaluate_with_edp_agent(self):
+        """evaluate() calls run_edp_agent when inference_mode='edp-agent'."""
+        config = EvolutionConfig(inference_mode="edp-agent", evaluator="fast")
+
+        with patch("evolution.skills.skill_module.run_edp_agent") as mock_run:
+            mock_run.return_value = {
+                "output": "test output",
+                "messages": [],
+                "completed": True,
+            }
+
+            adapter = SkillEvolutionAdapter(config)
+            batch = [
+                {"input": "task1", "answer": "expected1"},
+                {"input": "task2", "answer": "expected2"},
+            ]
+            result = adapter.evaluate(batch, {"skill_body": "skill text"}, capture_traces=False)
+
+            assert len(result.scores) == 2
+            assert mock_run.call_count == 2
+            # Verify skill_text is passed through
+            mock_run.assert_called_with("skill text", "task2", config)

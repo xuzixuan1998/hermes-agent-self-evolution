@@ -1,0 +1,12 @@
+# 生成产物（每次 build / export 重新生成）
+.build-context/
+bundle/
+
+# 本地配置（含企业凭证，禁止入库）
+# .example 模板保留
+config/*.env
+!config/*.env.example
+
+# Python 缓存
+__pycache__/
+*.pyc

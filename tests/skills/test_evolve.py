@@ -73,6 +73,19 @@ class TestEvolveDryRun:
             evolve(skill_name="test", dry_run=True,
                    inference_mode="hermes-agent", evaluator="llm-judge")
 
+    def test_dry_run_accepts_edp_agent(self, tmp_path, monkeypatch):
+        """--inference edp-agent --dry-run should succeed without error."""
+        monkeypatch.chdir(tmp_path)
+        sf = tmp_path / "SKILL.md"
+        sf.write_text(SAMPLE_SKILL_MD)
+
+        with (
+            patch("evolution.core.config.get_hermes_agent_path", return_value=sf.parent),
+            patch("evolution.skills.evolve_skill.find_skill", return_value=sf),
+            patch("evolution.skills.evolve_skill.load_skill", return_value=_skill_dict(sf)),
+        ):
+            evolve(skill_name="test", dry_run=True, inference_mode="edp-agent")
+
 
 class TestEvolveLegacyPath:
     @pytest.fixture(autouse=True)

@@ -13,6 +13,10 @@ class EvolutionConfig:
     # hermes-agent repo path
     hermes_agent_path: Path = field(default_factory=lambda: get_hermes_agent_path())
 
+    # edp-agent paths (for inference_mode="edp-agent")
+    agent_framework_path: Optional[Path] = None  # a2a_service path for sys.path injection
+    edp_agent_path: Path = field(default_factory=lambda: _get_edp_agent_path())
+
     # Optimization parameters
     iterations: int = 10
     population_size: int = 5
@@ -39,7 +43,8 @@ class EvolutionConfig:
     run_tblite: bool = False  # Expensive — opt-in
     tblite_regression_threshold: float = 0.02  # Max 2% regression allowed
 
-    # Inference mode: "single-turn" (dspy.ChainOfThought) or "hermes-agent" (AIAgent.run_conversation)
+    # Inference mode: "single-turn" (dspy.ChainOfThought), "hermes-agent" (AIAgent.run_conversation),
+    # or "edp-agent" (EDPAgent.agent_stream)
     inference_mode: str = "single-turn"
     # Evaluator: "fast" (keyword overlap) or "llm-judge" (LLMJudge 3D scoring)
     evaluator: str = "fast"
@@ -79,3 +84,8 @@ def get_hermes_agent_path() -> Path:
         "Cannot find hermes-agent repo. Set HERMES_AGENT_REPO env var "
         "or ensure it exists at ~/.hermes/hermes-agent"
     )
+
+
+def _get_edp_agent_path() -> Path:
+    """Discover the edp_agent directory within the current project."""
+    return Path(__file__).parent.parent.parent / "edp_agent"

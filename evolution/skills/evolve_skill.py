@@ -392,7 +392,7 @@ def evolve(
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
 @click.option("--inference", "inference_mode", default="single-turn",
-              type=click.Choice(["single-turn", "hermes-agent"]),
+              type=click.Choice(["single-turn", "hermes-agent", "edp-agent"]),
               help="How to execute the skill during evaluation")
 @click.option("--evaluator", "evaluator", default="fast",
               type=click.Choice(["fast", "llm-judge"]),

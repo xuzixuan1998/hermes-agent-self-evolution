@@ -221,7 +221,15 @@ class SkillEvolutionAdapter:
         self.config = config
         self.inference = config.inference_mode
         self.evaluator = config.evaluator
-        self.run_fn = run_hermes_agent if self.inference == "hermes-agent" else run_single_turn
+
+        if self.inference == "edp-agent":
+            from evolution.skills.skill_module import run_edp_agent
+            self.run_fn = run_edp_agent
+        elif self.inference == "hermes-agent":
+            self.run_fn = run_hermes_agent
+        else:
+            self.run_fn = run_single_turn
+
         self.judge = LLMJudge(config) if self.evaluator == "llm-judge" else None
         self._trajectories: list[dict] = []
 

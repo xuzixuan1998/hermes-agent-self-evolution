@@ -1,0 +1,12 @@
+# Test env (contains credentials)
+.env.test
+.env
+
+# Pytest
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Skills are NOT open-sourced — assembled from agent-store-zhl per docs/deployment.md §0.3
+# Keep skills/__init__.py (empty package marker) but exclude all skill subdirs.
+skills/*/

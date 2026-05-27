@@ -37,7 +37,7 @@ Homepage = "https://github.com/NousResearch/hermes-agent-self-evolution"
 Repository = "https://github.com/NousResearch/hermes-agent-self-evolution"
 
 [tool.setuptools.packages.find]
-include = ["evolution*"]
+include = ["evolution*", "edp_agent*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

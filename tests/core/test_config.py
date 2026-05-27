@@ -50,3 +50,19 @@ class TestEvolutionConfigNewFields:
         assert default.agent_max_iterations == 10
         # Sanity check that custom is still custom
         assert custom.inference_mode == "hermes-agent"
+
+    def test_config_inference_mode_edp_agent(self):
+        """inference_mode='edp-agent' is supported."""
+        config = EvolutionConfig(inference_mode="edp-agent")
+        assert config.inference_mode == "edp-agent"
+
+    def test_config_edp_agent_path_default(self):
+        """edp_agent_path defaults to the project's edp_agent/ directory."""
+        config = EvolutionConfig()
+        assert config.edp_agent_path is not None
+        assert config.edp_agent_path.name == "edp_agent"
+
+    def test_config_agent_framework_path_default_none(self):
+        """agent_framework_path defaults to None."""
+        config = EvolutionConfig()
+        assert config.agent_framework_path is None
