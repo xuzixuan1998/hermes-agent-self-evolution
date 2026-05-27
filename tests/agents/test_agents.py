@@ -178,6 +178,32 @@ class TestEDPAgent:
             assert len(skill_calls) == 1
             assert len(agentrule_calls) == 0
 
+    def test_run_returns_false_when_infer_url_not_set(self):
+        """EDPAgent returns completed=False gracefully when env vars missing."""
+        agent = EDPAgent()
+        # No env vars set — _infer_url is empty
+        result = agent.run("prompt", "task", self._make_mock_config())
+        assert result["completed"] is False
+
+    def test_run_skips_duplicate_update(self):
+        """Body caching: same system_prompt only triggers one update call."""
+        with patch.dict(os.environ, self._env), patch("httpx.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "output": "ok", "messages": [], "completed": True,
+            }
+            mock_post.return_value.raise_for_status = MagicMock()
+
+            agent = EDPAgent()
+            # Same body twice
+            agent.run("same body", "task1", self._make_mock_config())
+            agent.run("same body", "task2", self._make_mock_config())
+
+            agentrule_calls = [
+                c for c in mock_post.call_args_list
+                if c.kwargs.get("json", {}).get("body") == "same body"
+            ]
+            assert len(agentrule_calls) == 1  # Only first call triggers POST
+
     def test_run_handles_http_error_gracefully(self):
         with patch.dict(os.environ, self._env), patch("httpx.post", side_effect=httpx.HTTPError("down")):
             agent = EDPAgent()

@@ -14,11 +14,15 @@ class EDPAgent(BaseAgent):
     """Execute agent inference via remote EDP HTTP API."""
 
     def __init__(self):
-        self._infer_url = os.environ["EDP_INFER_URL"]
-        self._agentrule_update_url = os.environ["EDP_AGENTRULE_UPDATE_URL"]
+        self._infer_url = os.environ.get("EDP_INFER_URL", "")
+        self._agentrule_update_url = os.environ.get("EDP_AGENTRULE_UPDATE_URL", "")
         self._skill_update_url = os.environ.get("EDP_SKILL_UPDATE_URL", "")
+        self._last_agentrule_body = None
+        self._last_skill_body = None
 
     def update_agentrule(self, body: str) -> None:
+        if not self._agentrule_update_url:
+            return
         httpx.post(self._agentrule_update_url, json={"body": body}).raise_for_status()
 
     def update_skill(self, name: str, body: str) -> None:
@@ -32,11 +36,18 @@ class EDPAgent(BaseAgent):
         return resp.json()
 
     def run(self, system_prompt: str, task_input: str, config) -> dict:
+        if not self._infer_url:
+            logger.error("EDP_INFER_URL not set")
+            return {"output": "", "messages": [], "completed": False}
         try:
             if config is not None and getattr(config, "skill_name", None):
-                self.update_skill(config.skill_name, system_prompt)
+                if system_prompt != self._last_skill_body:
+                    self.update_skill(config.skill_name, system_prompt)
+                    self._last_skill_body = system_prompt
             else:
-                self.update_agentrule(system_prompt)
+                if system_prompt != self._last_agentrule_body:
+                    self.update_agentrule(system_prompt)
+                    self._last_agentrule_body = system_prompt
             return self.infer(task_input)
         except Exception:
             logger.exception("EDPAgent.run failed")

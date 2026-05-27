@@ -1,7 +1,7 @@
 """Evolve an agent prompt (e.g., AgentRule.md) using DSPy + GEPA.
 
 Usage:
-    python -m evolution.prompts.evolve_prompt --prompt edp_agent/AgentRule.md --inference edp-agent --iterations 10
+    python -m evolution.prompts.evolve_prompt --prompt ./AgentRule.md --inference edp-agent --iterations 10
     python -m evolution.prompts.evolve_prompt --prompt /path/to/AgentRule.md --dry-run
 """
 
@@ -344,7 +344,7 @@ def evolve(
 
 
 @click.command()
-@click.option("--prompt", required=True, help="Path to the prompt file to evolve (e.g., edp_agent/AgentRule.md)")
+@click.option("--prompt", required=True, help="Path to the prompt file to evolve (e.g., ./AgentRule.md)")
 @click.option("--iterations", default=10, help="Number of GEPA iterations")
 @click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
               help="Source for evaluation dataset")

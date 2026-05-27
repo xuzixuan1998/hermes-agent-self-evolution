@@ -151,18 +151,6 @@ def _summarize_trajectory(messages: list[dict], max_messages: int = 20) -> dict:
     }
 
 
-def skill_fitness_metric(example: dspy.Example, prediction: dspy.Prediction, trace=None) -> float:
-    """DSPy-compatible metric function for skill optimization.
-
-    This is what gets passed to dspy.GEPA(metric=...).
-    Returns a float 0-1 score.
-    """
-    agent_output = getattr(prediction, "output", "") or ""
-    expected = getattr(example, "expected_behavior", "") or ""
-
-    return _keyword_overlap(agent_output, expected)
-
-
 def _parse_score(value) -> float:
     """Parse a score value, handling various LLM output formats."""
     if isinstance(value, (int, float)):
@@ -171,41 +159,6 @@ def _parse_score(value) -> float:
         return min(1.0, max(0.0, float(str(value).strip())))
     except (ValueError, TypeError):
         return 0.5  # Default to neutral on parse failure
-
-
-def make_gepa_evaluator(config: "EvolutionConfig"):
-    """Create a per-example evaluator compatible with EvolutionAdapter.
-
-    Returns a function (data, response) -> EvaluationResult.
-    data is a gepa DefaultDataInst dict with 'input', 'answer' keys.
-    """
-    evaluator = config.evaluator
-    judge = LLMJudge(config) if evaluator == "llm-judge" else None
-
-    def evaluator_fn(data, response: str):
-        task_input = ""
-        expected = ""
-        if isinstance(data, dict):
-            task_input = data.get("input", "") or ""
-            expected = data.get("answer", "") or ""
-
-        feedback = ""
-        if evaluator == "llm-judge" and judge:
-            fitness = judge.score(
-                task_input=task_input,
-                expected_behavior=expected,
-                agent_output=response,
-                skill_text="",
-            )
-            score = fitness.composite
-            feedback = fitness.feedback
-        else:
-            score = _keyword_overlap(response, expected)
-
-        from gepa.adapters.default_adapter.default_adapter import EvaluationResult
-        return EvaluationResult(score=score, feedback=feedback)
-
-    return evaluator_fn
 
 
 class EvolutionAdapter:

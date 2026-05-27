@@ -1,16 +1,13 @@
 """Tests for fitness functions: keyword overlap, trajectory summarization,
-make_gepa_evaluator, and EvolutionAdapter."""
+and EvolutionAdapter."""
 
-import pytest
 from unittest.mock import MagicMock, patch
 
 from evolution.core.config import EvolutionConfig
 from evolution.core.fitness import (
     _keyword_overlap,
     _summarize_trajectory,
-    make_gepa_evaluator,
     EvolutionAdapter,
-    skill_fitness_metric,
 )
 
 
@@ -51,50 +48,6 @@ class TestSummarizeTrajectory:
         msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
         result = _summarize_trajectory(msgs)
         assert result["tool_calls_used"] == []
-
-
-class TestMakeGepaEvaluator:
-    """Tests for make_gepa_evaluator.
-
-    Returns (data: dict, response: str) -> EvaluationResult(score, feedback, objective_scores).
-    """
-
-    @staticmethod
-    def _data(**overrides):
-        ex = {"input": "solve the task", "answer": "expected answer"}
-        ex.update(overrides)
-        return ex
-
-    def test_fast_evaluator(self):
-        """fast evaluator uses _keyword_overlap."""
-        config = EvolutionConfig(inference_mode="single-turn", evaluator="fast")
-        fn = make_gepa_evaluator(config)
-        result = fn(self._data(), "expected answer test output")
-        assert isinstance(result.score, float)
-        assert result.score > 0.5
-
-    def test_fast_evaluator_low_score(self):
-        """fast evaluator: low keyword overlap."""
-        config = EvolutionConfig(inference_mode="single-turn", evaluator="fast")
-        fn = make_gepa_evaluator(config)
-        result = fn(self._data(answer="completely different"), "test output")
-        assert result.score <= 0.5
-
-    def test_llm_judge_evaluator(self):
-        """llm-judge evaluator uses LLMJudge, returns score + feedback."""
-        config = EvolutionConfig(inference_mode="single-turn", evaluator="llm-judge")
-        with patch("evolution.core.fitness.LLMJudge") as mock_judge_cls:
-            mock_judge_instance = MagicMock()
-            mock_judge_instance.score.return_value.composite = 0.85
-            mock_judge_instance.score.return_value.feedback = "Decent"
-            mock_judge_cls.return_value = mock_judge_instance
-
-            fn = make_gepa_evaluator(config)
-            result = fn(self._data(), "test output")
-
-        assert isinstance(result.score, float)
-        assert result.score == 0.85
-        assert result.feedback == "Decent"
 
 
 class TestEvolutionAdapter:
@@ -191,25 +144,6 @@ class TestEvolutionAdapter:
 
             assert len(adapter.trajectories) == 1
             assert adapter.trajectories[0]["task_input"] == "task1"
-
-
-class TestSkillFitnessMetricUnchanged:
-    """Verify the DSPy metric function still works."""
-
-    def test_returns_float(self):
-        import dspy
-        ex = dspy.Example(task_input="task", expected_behavior="expected output").with_inputs("task_input")
-        pred = dspy.Prediction(output="some expected output text")
-        score = skill_fitness_metric(ex, pred)
-        assert isinstance(score, float)
-        assert 0.0 <= score <= 1.0
-
-    def test_empty_output(self):
-        import dspy
-        ex = dspy.Example(task_input="task", expected_behavior="expected").with_inputs("task_input")
-        pred = dspy.Prediction(output="")
-        score = skill_fitness_metric(ex, pred)
-        assert score == 0.0
 
 
 class TestEvolutionAdapterEdpAgent:

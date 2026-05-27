@@ -10,8 +10,9 @@ from typing import Optional
 class EvolutionConfig:
     """Configuration for a self-evolution optimization run."""
 
-    # hermes-agent repo path
-    hermes_agent_path: Path = field(default_factory=lambda: get_hermes_agent_path())
+    # hermes-agent repo path (None if not found — HermesAgent raises at run time)
+    hermes_agent_path: Optional[Path] = field(
+        default_factory=lambda: get_hermes_agent_path())
 
     # Optimization parameters
     iterations: int = 10
@@ -56,13 +57,15 @@ class EvolutionConfig:
     create_pr: bool = True
 
 
-def get_hermes_agent_path() -> Path:
+def get_hermes_agent_path() -> Optional[Path]:
     """Discover the hermes-agent repo path.
 
     Priority:
     1. HERMES_AGENT_REPO env var
     2. ~/.hermes/hermes-agent (standard install location)
     3. ../hermes-agent (sibling directory)
+
+    Returns None if not found — callers should raise an appropriate error.
     """
     env_path = os.getenv("HERMES_AGENT_REPO")
     if env_path:
@@ -78,7 +81,4 @@ def get_hermes_agent_path() -> Path:
     if sibling_path.exists():
         return sibling_path
 
-    raise FileNotFoundError(
-        "Cannot find hermes-agent repo. Set HERMES_AGENT_REPO env var "
-        "or ensure it exists at ~/.hermes/hermes-agent"
-    )
+    return None

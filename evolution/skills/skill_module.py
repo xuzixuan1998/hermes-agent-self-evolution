@@ -29,11 +29,13 @@ def reassemble_skill(frontmatter: str, evolved_body: str) -> str:
     return reassemble_artifact(frontmatter, evolved_body)
 
 
-def find_skill(skill_name: str, hermes_agent_path: Path) -> Optional[Path]:
+def find_skill(skill_name: str, hermes_agent_path: Optional[Path]) -> Optional[Path]:
     """Find a skill by name in the hermes-agent skills directory.
 
     Searches recursively for a SKILL.md in a directory matching the skill name.
     """
+    if hermes_agent_path is None:
+        return None
     skills_dir = hermes_agent_path / "skills"
     if not skills_dir.exists():
         return None

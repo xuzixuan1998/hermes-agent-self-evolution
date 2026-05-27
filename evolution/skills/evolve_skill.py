@@ -111,6 +111,10 @@ def evolve(
     # ── 1. Find and load the skill ──────────────────────────────────────
     console.print(f"\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] — Evolving skill: [bold]{skill_name}[/bold]\n")
 
+    if config.hermes_agent_path is None:
+        console.print("[red]✗ hermes-agent repo not found — set HERMES_AGENT_REPO or install to ~/.hermes/hermes-agent[/red]")
+        sys.exit(1)
+
     skill_path = find_skill(skill_name, config.hermes_agent_path)
     if not skill_path:
         console.print(f"[red]✗ Skill '{skill_name}' not found in {config.hermes_agent_path / 'skills'}[/red]")
@@ -388,5 +392,4 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
 
 
 if __name__ == "__main__":
-    main()
     main()

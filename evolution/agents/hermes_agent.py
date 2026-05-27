@@ -9,21 +9,24 @@ class HermesAgent(BaseAgent):
     """Execute a skill via real Hermes agent (AIAgent.run_conversation)."""
 
     def run(self, system_prompt: str, task_input: str, config) -> dict:
-        if str(config.hermes_agent_path) not in sys.path:
-            sys.path.insert(0, str(config.hermes_agent_path))
+        if config.hermes_agent_path is None:
+            return {"output": "", "messages": [], "completed": False}
+
+        path_str = str(config.hermes_agent_path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
 
         from run_agent import AIAgent
 
         model = config.agent_model or config.optimizer_model
 
-        agent = AIAgent(
-            model=model,
-            quiet_mode=True,
-            max_iterations=config.agent_max_iterations,
-            enabled_toolsets=["terminal", "web"],
-        )
-
         try:
+            agent = AIAgent(
+                model=model,
+                quiet_mode=True,
+                max_iterations=config.agent_max_iterations,
+                enabled_toolsets=["terminal", "web"],
+            )
             result = agent.run_conversation(
                 user_message=task_input,
                 system_message=system_prompt,
