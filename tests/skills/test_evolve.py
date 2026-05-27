@@ -171,7 +171,7 @@ class TestEvolveGepaPath:
             patch("evolution.skills.evolve_skill.SkillModule") as skill_mod,
             patch("evolution.skills.evolve_skill.SyntheticDatasetBuilder") as builder,
             patch("evolution.skills.evolve_skill.ConstraintValidator") as validator,
-            patch("evolution.skills.evolve_skill.SkillEvolutionAdapter") as adapter_cls,
+            patch("evolution.skills.evolve_skill.EvolutionAdapter") as adapter_cls,
             patch("gepa.optimize") as mock_optimize,
         ):
             # SkillModule for holdout eval
@@ -187,7 +187,7 @@ class TestEvolveGepaPath:
             adapter_cls.return_value = adapter
 
             mock_optimize.return_value = MagicMock(
-                candidates=[{"skill_body": "evolved gepa body"}])
+                candidates=[{"artifact_body": "evolved gepa body"}])
 
             evolve(skill_name="test", iterations=4, **kw)
 

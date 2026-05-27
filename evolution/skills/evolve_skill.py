@@ -21,7 +21,7 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, get_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore, make_gepa_evaluator, SkillEvolutionAdapter
+from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore, make_gepa_evaluator, EvolutionAdapter
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
     SkillModule,
@@ -248,12 +248,12 @@ def evolve(
         # ── New path: gepa.optimize() with custom adapter ─────────
         from gepa import optimize
 
-        adapter = SkillEvolutionAdapter(config)
+        adapter = EvolutionAdapter(config)
 
         gepa_trainset = dataset.to_gepa_datainst("train")
         gepa_valset = dataset.to_gepa_datainst("val")
 
-        seed_candidate = {"skill_body": skill["body"]}
+        seed_candidate = {"artifact_body": skill["body"]}
 
         result = optimize(
             seed_candidate=seed_candidate,
@@ -269,7 +269,7 @@ def evolve(
         if result.candidates:
             best_candidate = result.candidates[-1]  # Last accepted candidate
             if isinstance(best_candidate, dict):
-                evolved_body = best_candidate.get("skill_body", "") or skill["body"]
+                evolved_body = best_candidate.get("artifact_body", "") or skill["body"]
             else:
                 evolved_body = skill["body"]
         else:

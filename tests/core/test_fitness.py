@@ -1,5 +1,5 @@
 """Tests for fitness functions: keyword overlap, trajectory summarization,
-make_gepa_evaluator, and SkillEvolutionAdapter."""
+make_gepa_evaluator, and EvolutionAdapter."""
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -9,7 +9,7 @@ from evolution.core.fitness import (
     _keyword_overlap,
     _summarize_trajectory,
     make_gepa_evaluator,
-    SkillEvolutionAdapter,
+    EvolutionAdapter,
     skill_fitness_metric,
 )
 
@@ -97,43 +97,56 @@ class TestMakeGepaEvaluator:
         assert result.feedback == "Decent"
 
 
-class TestSkillEvolutionAdapter:
-    """Tests for SkillEvolutionAdapter (custom GEPAAdapter)."""
+class TestEvolutionAdapter:
+    """Tests for EvolutionAdapter (custom GEPAAdapter)."""
 
     def _config(self, inference="single-turn", evaluator="fast"):
         return EvolutionConfig(inference_mode=inference, evaluator=evaluator)
 
+    def _mock_agent(self, agent_path, return_value=None):
+        """Patch an agent class and return the mock instance."""
+        rv = return_value or {"output": "test output", "messages": [], "completed": True}
+        mock_agent_cls = MagicMock()
+        mock_instance = MagicMock()
+        mock_instance.run.return_value = rv
+        mock_agent_cls.return_value = mock_instance
+        return patch(agent_path, mock_agent_cls), mock_instance
+
     def test_evaluate_basic(self):
         """evaluate() returns EvaluationBatch with correct lengths."""
         config = self._config()
-        with patch("evolution.skills.skill_module.run_single_turn") as mock_run:
-            mock_run.return_value = {"output": "test output", "messages": [], "completed": True}
+        with patch("evolution.agents.single_turn.SingleTurnAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run.return_value = {"output": "test output", "messages": [], "completed": True}
+            mock_agent_cls.return_value = mock_agent
 
-            adapter = SkillEvolutionAdapter(config)
+            adapter = EvolutionAdapter(config)
             batch = [
                 {"input": "task1", "answer": "expected1"},
                 {"input": "task2", "answer": "expected2"},
             ]
-            result = adapter.evaluate(batch, {"skill_body": "skill text"}, capture_traces=False)
+            result = adapter.evaluate(batch, {"artifact_body": "artifact text"}, capture_traces=False)
 
             assert len(result.scores) == 2
             assert len(result.outputs) == 2
             assert result.trajectories is None
-            assert mock_run.call_count == 2
+            assert mock_agent.run.call_count == 2
 
     def test_evaluate_with_traces(self):
         """evaluate() with capture_traces=True returns trajectories."""
         config = self._config(inference="hermes-agent")
-        with patch("evolution.skills.skill_module.run_hermes_agent") as mock_run:
-            mock_run.return_value = {
+        with patch("evolution.agents.hermes_agent.HermesAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run.return_value = {
                 "output": "test output",
                 "messages": [{"role": "user", "content": "hi"}],
                 "completed": True,
             }
+            mock_agent_cls.return_value = mock_agent
 
-            adapter = SkillEvolutionAdapter(config)
+            adapter = EvolutionAdapter(config)
             batch = [{"input": "task1", "answer": "expected1"}]
-            result = adapter.evaluate(batch, {"skill_body": "skill text"}, capture_traces=True)
+            result = adapter.evaluate(batch, {"artifact_body": "artifact text"}, capture_traces=True)
 
             assert len(result.trajectories) == 1
             assert result.trajectories[0]["output"] == "test output"
@@ -141,36 +154,40 @@ class TestSkillEvolutionAdapter:
     def test_make_reflective_dataset(self):
         """make_reflective_dataset builds per-component records."""
         config = self._config()
-        with patch("evolution.skills.skill_module.run_single_turn") as mock_run:
-            mock_run.return_value = {"output": "test", "messages": [], "completed": True}
+        with patch("evolution.agents.single_turn.SingleTurnAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run.return_value = {"output": "test", "messages": [], "completed": True}
+            mock_agent_cls.return_value = mock_agent
 
-            adapter = SkillEvolutionAdapter(config)
+            adapter = EvolutionAdapter(config)
             batch = [{"input": "task1", "answer": "expected1"}]
-            eval_batch = adapter.evaluate(batch, {"skill_body": "skill"}, capture_traces=True)
+            eval_batch = adapter.evaluate(batch, {"artifact_body": "artifact"}, capture_traces=True)
 
             dataset = adapter.make_reflective_dataset(
-                {"skill_body": "skill"}, eval_batch, ["skill_body"]
+                {"artifact_body": "artifact"}, eval_batch, ["artifact_body"]
             )
 
-            assert "skill_body" in dataset
-            assert len(dataset["skill_body"]) == 1
-            rec = dataset["skill_body"][0]
+            assert "artifact_body" in dataset
+            assert len(dataset["artifact_body"]) == 1
+            rec = dataset["artifact_body"][0]
             assert rec["Inputs"]["task"] == "task1"
             assert "Score" in rec
 
     def test_trajectories_property(self):
         """adapter.trajectories collects evaluation traces."""
         config = self._config(inference="hermes-agent")
-        with patch("evolution.skills.skill_module.run_hermes_agent") as mock_run:
-            mock_run.return_value = {
+        with patch("evolution.agents.hermes_agent.HermesAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run.return_value = {
                 "output": "test output",
                 "messages": [],
                 "completed": True,
             }
+            mock_agent_cls.return_value = mock_agent
 
-            adapter = SkillEvolutionAdapter(config)
+            adapter = EvolutionAdapter(config)
             batch = [{"input": "task1", "answer": "expected1"}]
-            adapter.evaluate(batch, {"skill_body": "skill"}, capture_traces=True)
+            adapter.evaluate(batch, {"artifact_body": "artifact"}, capture_traces=True)
 
             assert len(adapter.trajectories) == 1
             assert adapter.trajectories[0]["task_input"] == "task1"
@@ -195,31 +212,36 @@ class TestSkillFitnessMetricUnchanged:
         assert score == 0.0
 
 
-class TestSkillEvolutionAdapterEdpAgent:
-    """Tests for SkillEvolutionAdapter wiring with edp-agent."""
+class TestEvolutionAdapterEdpAgent:
+    """Tests for EvolutionAdapter wiring with edp-agent."""
 
     def test_adapter_wires_edp_agent(self):
-        """inference_mode='edp-agent' wires run_edp_agent."""
+        """inference_mode='edp-agent' creates EDPAgent instance."""
         config = EvolutionConfig(inference_mode="edp-agent")
-        with patch("evolution.skills.skill_module.run_edp_agent") as mock_run:
-            mock_run.return_value = {"output": "ok", "messages": [], "completed": True}
+        with patch("evolution.agents.edp_agent.EDPAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run.return_value = {"output": "ok", "messages": [], "completed": True}
+            mock_agent_cls.return_value = mock_agent
 
-            adapter = SkillEvolutionAdapter(config)
+            adapter = EvolutionAdapter(config)
 
-            assert adapter.run_fn is mock_run
+            assert adapter.agent is mock_agent
+            mock_agent_cls.assert_called_once()
 
-    def test_adapter_run_fn_signature(self):
-        """adapter.run_fn returns dict with output/messages/completed."""
+    def test_adapter_agent_run_signature(self):
+        """adapter.agent.run returns dict with output/messages/completed."""
         config = EvolutionConfig(inference_mode="edp-agent")
-        mock_run = MagicMock(return_value={
-            "output": "test",
-            "messages": [{"role": "user", "content": "hi"}],
-            "completed": True,
-        })
+        with patch("evolution.agents.edp_agent.EDPAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run.return_value = {
+                "output": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "completed": True,
+            }
+            mock_agent_cls.return_value = mock_agent
 
-        with patch("evolution.skills.skill_module.run_edp_agent", mock_run):
-            adapter = SkillEvolutionAdapter(config)
-            result = adapter.run_fn("skill text", "task input", config)
+            adapter = EvolutionAdapter(config)
+            result = adapter.agent.run("artifact text", "task input", config)
 
         assert isinstance(result, dict)
         assert "output" in result
@@ -229,24 +251,25 @@ class TestSkillEvolutionAdapterEdpAgent:
         assert result["completed"] is True
 
     def test_adapter_evaluate_with_edp_agent(self):
-        """evaluate() calls run_edp_agent when inference_mode='edp-agent'."""
+        """evaluate() calls EDPAgent.run when inference_mode='edp-agent'."""
         config = EvolutionConfig(inference_mode="edp-agent", evaluator="fast")
 
-        with patch("evolution.skills.skill_module.run_edp_agent") as mock_run:
-            mock_run.return_value = {
+        with patch("evolution.agents.edp_agent.EDPAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run.return_value = {
                 "output": "test output",
                 "messages": [],
                 "completed": True,
             }
+            mock_agent_cls.return_value = mock_agent
 
-            adapter = SkillEvolutionAdapter(config)
+            adapter = EvolutionAdapter(config)
             batch = [
                 {"input": "task1", "answer": "expected1"},
                 {"input": "task2", "answer": "expected2"},
             ]
-            result = adapter.evaluate(batch, {"skill_body": "skill text"}, capture_traces=False)
+            result = adapter.evaluate(batch, {"artifact_body": "artifact text"}, capture_traces=False)
 
             assert len(result.scores) == 2
-            assert mock_run.call_count == 2
-            # Verify skill_text is passed through
-            mock_run.assert_called_with("skill text", "task2", config)
+            assert mock_agent.run.call_count == 2
+            mock_agent.run.assert_called_with("artifact text", "task2", config)

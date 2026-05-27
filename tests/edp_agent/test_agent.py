@@ -28,6 +28,7 @@ _EXTERNAL_DEPS = [
     "openjiuwen.extensions.sys_operation.sandbox",
     "openjiuwen.extensions.sys_operation.sandbox.providers",
     "common",
+    "common.crypto",
     "common.events",
     "common.logger",
     "yaml",

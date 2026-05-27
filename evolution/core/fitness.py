@@ -174,7 +174,7 @@ def _parse_score(value) -> float:
 
 
 def make_gepa_evaluator(config: "EvolutionConfig"):
-    """Create a per-example evaluator compatible with SkillEvolutionAdapter.
+    """Create a per-example evaluator compatible with EvolutionAdapter.
 
     Returns a function (data, response) -> EvaluationResult.
     data is a gepa DefaultDataInst dict with 'input', 'answer' keys.
@@ -208,27 +208,28 @@ def make_gepa_evaluator(config: "EvolutionConfig"):
     return evaluator_fn
 
 
-class SkillEvolutionAdapter:
-    """Custom GEPAAdapter that runs skill evaluation via Hermes agent or single-turn LLM.
+class EvolutionAdapter:
+    """Custom GEPAAdapter that runs evaluation via pluggable agent backends.
 
     Implements gepa's GEPAAdapter protocol so the full agent execution (tool calls,
     multi-turn reasoning) is part of the evaluation, not just a single LLM completion.
     """
 
     def __init__(self, config: "EvolutionConfig"):
-        from evolution.skills.skill_module import run_single_turn, run_hermes_agent
+        from evolution.agents.single_turn import SingleTurnAgent
+        from evolution.agents.hermes_agent import HermesAgent
 
         self.config = config
         self.inference = config.inference_mode
         self.evaluator = config.evaluator
 
         if self.inference == "edp-agent":
-            from evolution.skills.skill_module import run_edp_agent
-            self.run_fn = run_edp_agent
+            from evolution.agents.edp_agent import EDPAgent
+            self.agent = EDPAgent()
         elif self.inference == "hermes-agent":
-            self.run_fn = run_hermes_agent
+            self.agent = HermesAgent()
         else:
-            self.run_fn = run_single_turn
+            self.agent = SingleTurnAgent()
 
         self.judge = LLMJudge(config) if self.evaluator == "llm-judge" else None
         self._trajectories: list[dict] = []
@@ -241,9 +242,9 @@ class SkillEvolutionAdapter:
         """Run candidate on each DataInst and return EvaluationBatch."""
         from gepa.core.adapter import EvaluationBatch
 
-        skill_text = ""
+        artifact_body = ""
         if isinstance(candidate, dict):
-            skill_text = candidate.get("skill_body", "") or ""
+            artifact_body = candidate.get("artifact_body", "") or ""
 
         outputs = []
         scores = []
@@ -256,7 +257,7 @@ class SkillEvolutionAdapter:
                 task_input = data.get("input", "") or ""
                 expected = data.get("answer", "") or ""
 
-            result = self.run_fn(skill_text, task_input, self.config)
+            result = self.agent.run(artifact_body, task_input, self.config)
             output = result["output"]
             messages = result["messages"]
 
@@ -265,7 +266,7 @@ class SkillEvolutionAdapter:
                     task_input=task_input,
                     expected_behavior=expected,
                     agent_output=output,
-                    skill_text=skill_text,
+                    skill_text=artifact_body,
                 )
                 score = fitness.composite
                 feedback = fitness.feedback
